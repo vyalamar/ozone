@@ -17,10 +17,13 @@
 
 package org.apache.hadoop.hdds.utils.db;
 
+import java.util.Arrays;
 import java.util.NoSuchElementException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import org.apache.hadoop.hdds.utils.db.managed.ManagedReadOptions;
 import org.apache.hadoop.hdds.utils.db.managed.ManagedRocksIterator;
+import org.apache.ratis.util.function.CheckedFunction;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -38,30 +41,58 @@ abstract class RDBStoreAbstractIterator<RAW>
   private final ManagedRocksIterator rocksDBIterator;
   private final RDBTable rocksDBTable;
   private Table.KeyValue<RAW, RAW> currentEntry;
-  // This is for schemas that use a fixed-length
-  // prefix for each key.
-  private final RAW prefix;
   private final IteratorType type;
+  private final ManagedReadOptions readOptions;
   private final AtomicBoolean isIteratorClosed = new AtomicBoolean(false);
 
   /**
-   * Constructor for RDBStoreAbstractIterator.
-   * Callers must ensure that the iterator is always obtained using try-with-resources
-   * or always closed in a finally block to ensure accurate refcounting.
+   * Constructor for RDBStoreAbstractIterator using a prefix.
    */
-  RDBStoreAbstractIterator(ManagedRocksIterator iterator, RDBTable table, RAW prefix, IteratorType type) {
-    this.rocksDBIterator = iterator;
+  RDBStoreAbstractIterator(
+      CheckedFunction<ManagedReadOptions, ManagedRocksIterator, RocksDatabaseException> iteratorSupplier,
+      RDBTable table, byte[] prefix, IteratorType type) throws RocksDatabaseException {
+    this(iteratorSupplier, table, prefix, getNextHigherPrefix(prefix), type);
+  }
+
+  /**
+   * Constructor for RDBStoreAbstractIterator using explicit bounds.
+   */
+  RDBStoreAbstractIterator(
+      CheckedFunction<ManagedReadOptions, ManagedRocksIterator, RocksDatabaseException> iteratorSupplier,
+      RDBTable table, byte[] lowerBound, byte[] upperBound, IteratorType type) throws RocksDatabaseException {
     this.rocksDBTable = table;
-    this.prefix = prefix;
     this.type = type;
+    this.readOptions = new ManagedReadOptions(lowerBound, upperBound);
+    try {
+      this.rocksDBIterator = iteratorSupplier.apply(readOptions);
+    } catch (RocksDatabaseException e) {
+      readOptions.close();
+      throw e;
+    }
+  }
+
+  /**
+   * Computes the exclusive upper bound for a given prefix.
+   * Walks bytes from end, finds first non-0xFF byte, increments it, and truncates.
+   * Returns null if prefix is null/empty or all bytes are 0xFF (no upper bound).
+   */
+  static byte[] getNextHigherPrefix(byte[] prefix) {
+    if (prefix == null || prefix.length == 0) {
+      return null;
+    }
+    for (int i = prefix.length - 1; i >= 0; i--) {
+      if ((prefix[i] & 0xFF) != 0xFF) {
+        byte[] result = Arrays.copyOf(prefix, i + 1);
+        result[i]++;
+        return result;
+      }
+    }
+    return null; // all bytes are 0xFF, no upper bound
   }
 
   IteratorType getType() {
     return type;
   }
-
-  /** @return the key for the current entry. */
-  abstract RAW key();
 
   /** @return the {@link Table.KeyValue} for the current entry. */
   abstract Table.KeyValue<RAW, RAW> getKeyValue();
@@ -72,19 +103,12 @@ abstract class RDBStoreAbstractIterator<RAW>
   /** Delete the given key. */
   abstract void delete(RAW key) throws RocksDatabaseException;
 
-  /** Does the given key start with the prefix? */
-  abstract boolean startsWithPrefix(RAW key);
-
   final ManagedRocksIterator getRocksDBIterator() {
     return rocksDBIterator;
   }
 
   final RDBTable getRocksDBTable() {
     return rocksDBTable;
-  }
-
-  final RAW getPrefix() {
-    return prefix;
   }
 
   @Override
@@ -112,8 +136,7 @@ abstract class RDBStoreAbstractIterator<RAW>
     if (isDbClosed()) {
       return false;
     }
-    return rocksDBIterator.get().isValid() &&
-        (prefix == null || startsWithPrefix(key()));
+    return rocksDBIterator.get().isValid();
   }
 
   @Override
@@ -128,21 +151,13 @@ abstract class RDBStoreAbstractIterator<RAW>
 
   @Override
   public final void seekToFirst() {
-    if (prefix == null) {
-      rocksDBIterator.get().seekToFirst();
-    } else {
-      seek0(prefix);
-    }
+    rocksDBIterator.get().seekToFirst();
     setCurrentEntry();
   }
 
   @Override
   public final void seekToLast() {
-    if (prefix == null) {
-      rocksDBIterator.get().seekToLast();
-    } else {
-      throw new UnsupportedOperationException("seekToLast: prefix != null");
-    }
+    rocksDBIterator.get().seekToLast();
     setCurrentEntry();
   }
 
@@ -168,7 +183,11 @@ abstract class RDBStoreAbstractIterator<RAW>
   @Override
   public void close() {
     if (isIteratorClosed.compareAndSet(false, true)) {
-      rocksDBIterator.close();
+      try {
+        rocksDBIterator.close();
+      } finally {
+        readOptions.close();
+      }
     }
   }
 }

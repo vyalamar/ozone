@@ -28,6 +28,7 @@ import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.Spliterator;
 import java.util.Objects;
 import org.apache.hadoop.hdds.utils.IOUtils;
 import org.apache.hadoop.hdds.utils.MetadataKeyFilters.KeyPrefixFilter;
@@ -400,12 +401,30 @@ public class TypedTable<KEY, VALUE> implements Table<KEY, VALUE> {
   @Override
   public KeyValueIterator<KEY, VALUE> iterator(KEY prefix, IteratorType type)
       throws RocksDatabaseException, CodecException {
+    final byte[] prefixBytes = encodeKey(prefix);
     if (supportCodecBuffer) {
-      return newCodecBufferTableIterator(prefix, type);
+      return newCodecBufferTableIterator(rawTable.newCodecBufferIterator(prefixBytes, type));
     } else {
-      final byte[] prefixBytes = encodeKey(prefix);
       return new TypedTableIterator(rawTable.iterator(prefixBytes, type));
     }
+  }
+
+  @Override
+  public KeyValueSpliterator<KEY, VALUE> spliterator(int maxParallelism, boolean closeOnEx)
+      throws RocksDatabaseException, CodecException {
+    return spliterator(null, null, maxParallelism, closeOnEx);
+  }
+
+  @Override
+  public KeyValueSpliterator<KEY, VALUE> spliterator(KEY startKey, KEY prefix, int maxParallelism, boolean closeOnEx)
+      throws RocksDatabaseException, CodecException {
+    final byte[] startKeyBytes = encodeKey(startKey);
+    final byte[] prefixBytes = encodeKey(prefix);
+    
+    KeyValueSpliterator<byte[], byte[]> rawSpliterator =
+        rawTable.spliterator(startKeyBytes, prefixBytes, maxParallelism, closeOnEx);
+        
+    return new TypedTableSpliterator(rawSpliterator);
   }
 
   @Override
@@ -493,27 +512,6 @@ public class TypedTable<KEY, VALUE> implements Table<KEY, VALUE> {
     return cache;
   }
 
-  private RawIterator<CodecBuffer> newCodecBufferTableIterator(KEY prefix, IteratorType type)
-      throws RocksDatabaseException, CodecException {
-    final CodecBuffer encoded = encodeKeyCodecBuffer(prefix);
-    final CodecBuffer prefixBuffer;
-    if (encoded != null && encoded.readableBytes() == 0) {
-      encoded.release();
-      prefixBuffer = null;
-    } else {
-      prefixBuffer = encoded;
-    }
-
-    try {
-      return newCodecBufferTableIterator(rawTable.iterator(prefixBuffer, type));
-    } catch (Throwable t) {
-      if (prefixBuffer != null) {
-        prefixBuffer.release();
-      }
-      throw t;
-    }
-  }
-
   private RawIterator<CodecBuffer> newCodecBufferTableIterator(KeyValueIterator<CodecBuffer, CodecBuffer> i) {
     return new RawIterator<CodecBuffer>(i) {
       @Override
@@ -564,6 +562,55 @@ public class TypedTable<KEY, VALUE> implements Table<KEY, VALUE> {
       final byte[] valueBytes = raw.getValue();
       return valueBytes == null ? Table.newKeyValue(key, null)
           : Table.newKeyValue(key, decodeValue(valueBytes), valueBytes.length);
+    }
+  }
+
+  /**
+   * Spliterator implementation for strongly typed tables.
+   */
+  public class TypedTableSpliterator implements KeyValueSpliterator<KEY, VALUE> {
+    private final KeyValueSpliterator<byte[], byte[]> rawSpliterator;
+
+    TypedTableSpliterator(KeyValueSpliterator<byte[], byte[]> rawSpliterator) {
+      this.rawSpliterator = rawSpliterator;
+    }
+
+    @Override
+    public boolean tryAdvance(java.util.function.Consumer<? super KeyValue<KEY, VALUE>> action) {
+      return rawSpliterator.tryAdvance(raw -> {
+        try {
+          final KEY key = decodeKey(raw.getKey());
+          final byte[] valueBytes = raw.getValue();
+          final VALUE value = valueBytes == null ? null : decodeValue(valueBytes);
+          action.accept(Table.newKeyValue(key, value, valueBytes == null ? -1 : valueBytes.length));
+        } catch (CodecException e) {
+          throw new IllegalStateException("Failed to decode in TypedTableSpliterator", e);
+        }
+      });
+    }
+
+    @Override
+    public Spliterator<KeyValue<KEY, VALUE>> trySplit() {
+      Spliterator<KeyValue<byte[], byte[]>> splitRaw = rawSpliterator.trySplit();
+      if (splitRaw == null) {
+        return null;
+      }
+      return new TypedTableSpliterator((KeyValueSpliterator<byte[], byte[]>) splitRaw);
+    }
+
+    @Override
+    public long estimateSize() {
+      return rawSpliterator.estimateSize();
+    }
+
+    @Override
+    public int characteristics() {
+      return rawSpliterator.characteristics();
+    }
+
+    @Override
+    public void close() throws Exception {
+      rawSpliterator.close();
     }
   }
 

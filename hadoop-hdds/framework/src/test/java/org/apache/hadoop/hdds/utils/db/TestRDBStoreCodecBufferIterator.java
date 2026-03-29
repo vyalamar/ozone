@@ -20,7 +20,6 @@ package org.apache.hadoop.hdds.utils.db;
 import static org.apache.hadoop.hdds.utils.db.IteratorType.KEY_AND_VALUE;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
-import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.any;
@@ -39,6 +38,7 @@ import java.util.List;
 import java.util.NoSuchElementException;
 import java.util.concurrent.ThreadLocalRandom;
 import org.apache.hadoop.hdds.StringUtils;
+import org.apache.hadoop.hdds.utils.db.managed.ManagedReadOptions;
 import org.apache.hadoop.hdds.utils.db.managed.ManagedRocksIterator;
 import org.apache.hadoop.hdds.utils.db.managed.ManagedRocksObjectUtils;
 import org.apache.log4j.Level;
@@ -61,6 +61,7 @@ public class TestRDBStoreCodecBufferIterator {
 
   @BeforeEach
   public void setup() {
+    ManagedRocksObjectUtils.loadRocksDBLibrary();
     CodecBuffer.enableLeakDetection();
     rocksIteratorMock = mock(RocksIterator.class);
     managedRocksIterator = newManagedRocksIterator();
@@ -72,12 +73,12 @@ public class TestRDBStoreCodecBufferIterator {
     return new ManagedRocksIterator(rocksIteratorMock);
   }
 
-  RDBStoreCodecBufferIterator newIterator() {
-    return new RDBStoreCodecBufferIterator(managedRocksIterator, null, null, KEY_AND_VALUE);
+  RDBStoreCodecBufferIterator newIterator() throws RocksDatabaseException {
+    return new RDBStoreCodecBufferIterator(readOptions -> managedRocksIterator, null, null, KEY_AND_VALUE);
   }
 
-  RDBStoreCodecBufferIterator newIterator(CodecBuffer prefix) {
-    return new RDBStoreCodecBufferIterator(managedRocksIterator, rdbTableMock, prefix, KEY_AND_VALUE);
+  RDBStoreCodecBufferIterator newIterator(byte[] prefix) throws RocksDatabaseException {
+    return new RDBStoreCodecBufferIterator(readOptions -> managedRocksIterator, rdbTableMock, prefix, KEY_AND_VALUE);
   }
 
   Answer<Integer> newAnswerInt(String name, int b) {
@@ -332,26 +333,24 @@ public class TestRDBStoreCodecBufferIterator {
   @Test
   public void testNormalPrefixedIterator() throws Exception {
     final byte[] prefixBytes = "sample".getBytes(StandardCharsets.UTF_8);
-    try (RDBStoreCodecBufferIterator i = newIterator(
-        CodecBuffer.wrap(prefixBytes))) {
-      final ByteBuffer prefix = ByteBuffer.wrap(prefixBytes);
-      verify(rocksIteratorMock, times(1)).seek(prefix);
+    try (RDBStoreCodecBufferIterator i = newIterator(prefixBytes)) {
+      // With native bounds, constructor calls seekToFirst() (lower bound enforces prefix)
+      verify(rocksIteratorMock, times(1)).seekToFirst();
       clearInvocations(rocksIteratorMock);
 
       i.seekToFirst();
-      verify(rocksIteratorMock, times(1)).seek(prefix);
+      verify(rocksIteratorMock, times(1)).seekToFirst();
       clearInvocations(rocksIteratorMock);
 
       when(rocksIteratorMock.isValid()).thenReturn(true);
-      when(rocksIteratorMock.key(any()))
-          .then(newAnswer("key1", prefixBytes));
       assertTrue(i.hasNext());
+      // hasNext() only checks isValid(); prefix filtering is done natively by RocksDB
       verify(rocksIteratorMock, times(1)).isValid();
-      verify(rocksIteratorMock, times(1)).key(any());
+      verify(rocksIteratorMock, times(0)).key(any());
 
-      Exception e =
-          assertThrows(Exception.class, () -> i.seekToLast(), "Prefixed iterator does not support seekToLast");
-      assertInstanceOf(UnsupportedOperationException.class, e);
+      // seekToLast() is now supported even with a prefix (upper bound restricts it natively)
+      i.seekToLast();
+      verify(rocksIteratorMock, times(1)).seekToLast();
     }
 
     CodecTestUtil.gc();

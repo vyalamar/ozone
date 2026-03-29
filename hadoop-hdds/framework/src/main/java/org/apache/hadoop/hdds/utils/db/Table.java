@@ -22,6 +22,7 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Spliterator;
 import org.apache.commons.lang3.NotImplementedException;
 import org.apache.hadoop.hdds.annotation.InterfaceStability;
 import org.apache.hadoop.hdds.utils.MetadataKeyFilters.KeyPrefixFilter;
@@ -195,6 +196,29 @@ public interface Table<KEY, VALUE> {
   /** The same as valueIterator(null). */
   default TableIterator<KEY, VALUE> valueIterator() throws RocksDatabaseException, CodecException {
     return valueIterator(null);
+  }
+
+  /**
+   * Returns a parallel capable Spliterator to iterate the elements in this table.
+   */
+  default KeyValueSpliterator<KEY, VALUE> spliterator() throws RocksDatabaseException, CodecException {
+    throw new NotImplementedException("spliterator is not implemented");
+  }
+
+  /**
+   * Returns a parallel capable Spliterator to iterate the elements in this table with a given max parallelism.
+   */
+  default KeyValueSpliterator<KEY, VALUE> spliterator(int maxParallelism, boolean closeOnEx)
+      throws RocksDatabaseException, CodecException {
+    throw new NotImplementedException("spliterator is not implemented");
+  }
+
+  /**
+   * Returns a parallel capable Spliterator starting from an optional given start key and prefix.
+   */
+  default KeyValueSpliterator<KEY, VALUE> spliterator(KEY startKey, KEY prefix, int maxParallelism, boolean closeOnEx)
+      throws RocksDatabaseException, CodecException {
+    throw new NotImplementedException("spliterator is not implemented");
   }
 
   /**
@@ -391,5 +415,13 @@ public interface Table<KEY, VALUE> {
   interface KeyValueIterator<KEY, VALUE>
       extends TableIterator<KEY, KeyValue<KEY, VALUE>> {
 
+  }
+
+  /** A {@link Spliterator} to iterate {@link KeyValue}s. */
+  interface KeyValueSpliterator<KEY, VALUE> extends Spliterator<KeyValue<KEY, VALUE>>, AutoCloseable {
+    @Override
+    default void close() throws Exception {
+      // no-op by default
+    }
   }
 }

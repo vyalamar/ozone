@@ -27,13 +27,58 @@ import org.rocksdb.ReadOptions;
  */
 public class ManagedReadOptions extends ReadOptions {
   private final UncheckedAutoCloseable leakTracker = track(this);
+  private final byte[] lowerBound;
+  private final byte[] upperBound;
+  private final ManagedSlice lowerBoundSlice;
+  private final ManagedSlice upperBoundSlice;
+
+  public ManagedReadOptions() {
+    this.lowerBound = null;
+    this.upperBound = null;
+    this.lowerBoundSlice = null;
+    this.upperBoundSlice = null;
+  }
+
+  public ManagedReadOptions(byte[] lowerBound, byte[] upperBound) {
+    this.lowerBound = lowerBound;
+    this.upperBound = upperBound;
+    this.lowerBoundSlice = lowerBound != null ? new ManagedSlice(lowerBound) : null;
+    this.upperBoundSlice = upperBound != null ? new ManagedSlice(upperBound) : null;
+    if (this.lowerBoundSlice != null) {
+      setIterateLowerBound(this.lowerBoundSlice);
+    }
+    if (this.upperBoundSlice != null) {
+      setIterateUpperBound(this.upperBoundSlice);
+    }
+    setFillCache(false);
+  }
+
+  public byte[] getLowerBound() {
+    return lowerBound;
+  }
+
+  public byte[] getUpperBound() {
+    return upperBound;
+  }
 
   @Override
   public void close() {
     try {
       super.close();
     } finally {
-      leakTracker.close();
+      try {
+        if (lowerBoundSlice != null) {
+          lowerBoundSlice.close();
+        }
+      } finally {
+        try {
+          if (upperBoundSlice != null) {
+            upperBoundSlice.close();
+          }
+        } finally {
+          leakTracker.close();
+        }
+      }
     }
   }
 }

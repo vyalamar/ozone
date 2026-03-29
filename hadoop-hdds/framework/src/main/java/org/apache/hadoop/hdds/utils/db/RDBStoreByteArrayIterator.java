@@ -17,26 +17,27 @@
 
 package org.apache.hadoop.hdds.utils.db;
 
-import java.util.Arrays;
+import org.apache.hadoop.hdds.utils.db.managed.ManagedReadOptions;
 import org.apache.hadoop.hdds.utils.db.managed.ManagedRocksIterator;
+import org.apache.ratis.util.function.CheckedFunction;
 
 /**
  * RocksDB store iterator using the byte[] API.
  */
 class RDBStoreByteArrayIterator extends RDBStoreAbstractIterator<byte[]> {
-  private static byte[] copyPrefix(byte[] prefix) {
-    return prefix == null || prefix.length == 0 ? null : Arrays.copyOf(prefix, prefix.length);
-  }
 
-  RDBStoreByteArrayIterator(ManagedRocksIterator iterator,
-      RDBTable table, byte[] prefix, IteratorType type) {
-    super(iterator, table, copyPrefix(prefix), type);
+  RDBStoreByteArrayIterator(
+      CheckedFunction<ManagedReadOptions, ManagedRocksIterator, RocksDatabaseException> iteratorSupplier,
+      RDBTable table, byte[] prefix, IteratorType type) throws RocksDatabaseException {
+    super(iteratorSupplier, table, prefix, type);
     seekToFirst();
   }
 
-  @Override
-  byte[] key() {
-    return getRocksDBIterator().get().key();
+  RDBStoreByteArrayIterator(
+      CheckedFunction<ManagedReadOptions, ManagedRocksIterator, RocksDatabaseException> iteratorSupplier,
+      RDBTable table, byte[] lowerBound, byte[] upperBound, IteratorType type) throws RocksDatabaseException {
+    super(iteratorSupplier, table, lowerBound, upperBound, type);
+    seekToFirst();
   }
 
   @Override
@@ -55,28 +56,5 @@ class RDBStoreByteArrayIterator extends RDBStoreAbstractIterator<byte[]> {
   @Override
   void delete(byte[] key) throws RocksDatabaseException {
     getRocksDBTable().delete(key);
-  }
-
-  @Override
-  boolean startsWithPrefix(byte[] value) {
-    final byte[] prefix = getPrefix();
-    if (prefix == null) {
-      return true;
-    }
-    if (value == null) {
-      return false;
-    }
-
-    int length = prefix.length;
-    if (value.length < length) {
-      return false;
-    }
-
-    for (int i = 0; i < length; i++) {
-      if (value[i] != prefix[i]) {
-        return false;
-      }
-    }
-    return true;
   }
 }

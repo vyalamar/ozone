@@ -214,13 +214,35 @@ class RDBTable implements Table<byte[], byte[]> {
   @Override
   public KeyValueIterator<byte[], byte[]> iterator(byte[] prefix, IteratorType type)
       throws RocksDatabaseException {
-    return new RDBStoreByteArrayIterator(db.newIterator(family, false), this,
-        prefix, type);
+    return new RDBStoreByteArrayIterator(readOptions -> db.newIterator(family, readOptions),
+        this, prefix, type);
   }
 
-  KeyValueIterator<CodecBuffer, CodecBuffer> iterator(
-      CodecBuffer prefix, IteratorType type) throws RocksDatabaseException {
-    return new RDBStoreCodecBufferIterator(db.newIterator(family, false),
+  public KeyValueIterator<byte[], byte[]> iterator(byte[] lowerBound, byte[] upperBound, IteratorType type)
+      throws RocksDatabaseException {
+    return new RDBStoreByteArrayIterator(readOptions -> db.newIterator(family, readOptions),
+        this, lowerBound, upperBound, type);
+  }
+
+  @Override
+  public KeyValueSpliterator<byte[], byte[]> spliterator(int maxParallelism, boolean closeOnEx) throws RocksDatabaseException {
+    return spliterator(null, null, maxParallelism, closeOnEx);
+  }
+
+  @Override
+  public KeyValueSpliterator<byte[], byte[]> spliterator(byte[] startKey, byte[] prefix, int maxParallelism, boolean closeOnEx)
+          throws RocksDatabaseException {
+      List<org.rocksdb.LiveFileMetaData> sstFiles = db.getLiveFilesMetaData().stream()
+          .filter(f -> org.apache.hadoop.hdds.StringUtils.bytes2String(f.columnFamilyName()).equals(family.getName()))
+          .collect(java.util.stream.Collectors.toList());
+      // Note: prefix parameter is intentionally ignored; it is a dead code parameter for now
+      // Prefix filtering is handled via iterator bounds at scan time, not at spliterator level
+      return new ByteArrayRawSpliterator(this, startKey, sstFiles, closeOnEx, maxParallelism);
+  }
+
+  KeyValueIterator<CodecBuffer, CodecBuffer> newCodecBufferIterator(
+      byte[] prefix, IteratorType type) throws RocksDatabaseException {
+    return new RDBStoreCodecBufferIterator(readOptions -> db.newIterator(family, readOptions),
         this, prefix, type);
   }
 
@@ -251,24 +273,14 @@ class RDBTable implements Table<byte[], byte[]> {
   @Override
   public void dumpToFileWithPrefix(File externalFile, byte[] prefix)
       throws RocksDatabaseException, CodecException {
-    CodecBuffer prefixBuffer = prefix == null || prefix.length == 0 ? null :
-        CodecBufferCodec.get(true).fromPersistedFormat(prefix);
-    KeyValueIterator<CodecBuffer, CodecBuffer> iter;
-    try {
-      iter = iterator(prefixBuffer, IteratorType.KEY_AND_VALUE);
-    } catch (RocksDatabaseException e) {
-      if (prefixBuffer != null) {
-        prefixBuffer.close();
-      }
-      throw e;
-    }
-    try (RDBSstFileWriter fileWriter = new RDBSstFileWriter(externalFile)) {
+    final byte[] prefixBytes = prefix == null || prefix.length == 0 ? null : prefix;
+    try (KeyValueIterator<CodecBuffer, CodecBuffer> iter =
+             newCodecBufferIterator(prefixBytes, IteratorType.KEY_AND_VALUE);
+         RDBSstFileWriter fileWriter = new RDBSstFileWriter(externalFile)) {
       while (iter.hasNext()) {
         final KeyValue<CodecBuffer, CodecBuffer> entry = iter.next();
         fileWriter.put(entry.getKey(), entry.getValue());
       }
-    } finally {
-      iter.close();
     }
   }
 
