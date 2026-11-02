@@ -21,6 +21,7 @@ import java.util.Arrays;
 import java.util.NoSuchElementException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
+import org.apache.hadoop.hdds.utils.IOUtils;
 import org.apache.hadoop.hdds.utils.db.managed.ManagedReadOptions;
 import org.apache.hadoop.hdds.utils.db.managed.ManagedRocksIterator;
 import org.slf4j.Logger;
@@ -97,11 +98,7 @@ abstract class RDBStoreAbstractIterator<RAW>
       readOptions.setFillCache(fillCache);
       return readOptions;
     } catch (RuntimeException | Error e) {
-      try {
-        readOptions.close();
-      } catch (RuntimeException | Error closeException) {
-        e.addSuppressed(closeException);
-      }
+      IOUtils.closeAndSuppress(readOptions, e);
       throw e;
     }
   }

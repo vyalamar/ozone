@@ -79,12 +79,24 @@ public class ManagedReadOptions extends ReadOptions {
 
   private void closeOnConstructorFailure(ManagedSlice lowerSlice,
       ManagedSlice upperSlice, Throwable failure) {
-    IOUtils.closeAndSuppress(failure, this::closeReadOptions, lowerSlice,
-        upperSlice, leakTracker);
+    IOUtils.closeAndSuppress(this::closeReadOptions, failure);
+    IOUtils.closeAndSuppress(lowerSlice, failure);
+    IOUtils.closeAndSuppress(upperSlice, failure);
+    IOUtils.closeAndSuppress(leakTracker, failure);
   }
 
   private void closeReadOptions() {
     super.close();
+  }
+
+  /** @return true iff the native lower bound slice is owned and still open. */
+  public boolean isLowerBoundSliceOwningHandle() {
+    return lowerBoundSlice != null && lowerBoundSlice.isOwningHandle();
+  }
+
+  /** @return true iff the native upper bound slice is owned and still open. */
+  public boolean isUpperBoundSliceOwningHandle() {
+    return upperBoundSlice != null && upperBoundSlice.isOwningHandle();
   }
 
   @Override

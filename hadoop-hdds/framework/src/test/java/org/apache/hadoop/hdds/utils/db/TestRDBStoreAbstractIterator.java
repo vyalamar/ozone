@@ -20,10 +20,16 @@ package org.apache.hadoop.hdds.utils.db;
 import static org.apache.hadoop.hdds.utils.db.IteratorType.KEY_AND_VALUE;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
+import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import org.apache.hadoop.hdds.utils.db.managed.ManagedReadOptions;
 import org.apache.hadoop.hdds.utils.db.managed.ManagedRocksIterator;
@@ -117,6 +123,64 @@ public class TestRDBStoreAbstractIterator {
 
     iterator.close();
     assertEquals(1, readOptions.getCloseCount());
+  }
+
+  @Test
+  public void testBoundSlicesClosedOnSuccessPath() {
+    final RocksIterator rocksIterator = mock(RocksIterator.class);
+    final ManagedReadOptions readOptions =
+        RDBStoreAbstractIterator.newReadOptions(new byte[] {'a'}, false);
+    assertTrue(readOptions.isLowerBoundSliceOwningHandle());
+    assertTrue(readOptions.isUpperBoundSliceOwningHandle());
+
+    try (RDBStoreByteArrayIterator iterator = new RDBStoreByteArrayIterator(
+        new ManagedRocksIterator(rocksIterator), null, new byte[] {'a'},
+        KEY_AND_VALUE, readOptions)) {
+      when(rocksIterator.isValid()).thenReturn(false);
+      assertFalse(iterator.hasNext());
+    }
+
+    assertFalse(readOptions.isLowerBoundSliceOwningHandle());
+    assertFalse(readOptions.isUpperBoundSliceOwningHandle());
+    assertFalse(readOptions.isOwningHandle());
+  }
+
+  @Test
+  public void testBoundSlicesClosedOnExceptionPath() {
+    final RocksIterator rocksIterator = mock(RocksIterator.class);
+    final ManagedReadOptions readOptions =
+        RDBStoreAbstractIterator.newReadOptions(new byte[] {'a'}, false);
+    final IllegalStateException failure = new IllegalStateException("boom");
+    when(rocksIterator.isValid()).thenThrow(failure);
+
+    final IllegalStateException thrown = assertThrows(
+        IllegalStateException.class, () -> {
+          try (RDBStoreByteArrayIterator iterator =
+                   new RDBStoreByteArrayIterator(
+                       new ManagedRocksIterator(rocksIterator), null,
+                       new byte[] {'a'}, KEY_AND_VALUE, readOptions)) {
+            iterator.hasNext();
+          }
+        });
+    assertSame(failure, thrown);
+    verify(rocksIterator, times(1)).close();
+    assertFalse(readOptions.isLowerBoundSliceOwningHandle());
+    assertFalse(readOptions.isUpperBoundSliceOwningHandle());
+  }
+
+  @Test
+  public void testReadOptionsClosedWhenRocksIteratorCloseFails() {
+    final RocksIterator rocksIterator = mock(RocksIterator.class);
+    doThrow(new IllegalStateException("close")).when(rocksIterator).close();
+    final ManagedReadOptions readOptions =
+        RDBStoreAbstractIterator.newReadOptions(new byte[] {'a'}, false);
+    final RDBStoreByteArrayIterator iterator = new RDBStoreByteArrayIterator(
+        new ManagedRocksIterator(rocksIterator), null, new byte[] {'a'},
+        KEY_AND_VALUE, readOptions);
+
+    assertThrows(IllegalStateException.class, iterator::close);
+    assertFalse(readOptions.isLowerBoundSliceOwningHandle());
+    assertFalse(readOptions.isUpperBoundSliceOwningHandle());
   }
 
   private static final class CountingReadOptions extends ManagedReadOptions {

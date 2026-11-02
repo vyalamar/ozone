@@ -25,6 +25,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.function.Supplier;
 import org.apache.hadoop.hdds.annotation.InterfaceAudience;
+import org.apache.hadoop.hdds.utils.IOUtils;
 import org.apache.hadoop.hdds.utils.MetadataKeyFilters.KeyPrefixFilter;
 import org.apache.hadoop.hdds.utils.db.RocksDatabase.ColumnFamily;
 import org.apache.hadoop.hdds.utils.db.managed.ManagedReadOptions;
@@ -255,10 +256,7 @@ class RDBTable implements Table<byte[], byte[]> {
       return new RDBStoreByteArrayIterator(rocksIterator, this, prefix, type,
           readOptions);
     } catch (RocksDatabaseException | RuntimeException e) {
-      if (rocksIterator != null) {
-        rocksIterator.close();
-      }
-      readOptions.close();
+      IOUtils.closeAndSuppress(e, rocksIterator, readOptions);
       throw e;
     }
   }
@@ -273,10 +271,7 @@ class RDBTable implements Table<byte[], byte[]> {
       return new RDBStoreCodecBufferIterator(rocksIterator, this, prefix, type,
           readOptions);
     } catch (RocksDatabaseException | RuntimeException e) {
-      if (rocksIterator != null) {
-        rocksIterator.close();
-      }
-      readOptions.close();
+      IOUtils.closeAndSuppress(e, rocksIterator, readOptions);
       throw e;
     }
   }
