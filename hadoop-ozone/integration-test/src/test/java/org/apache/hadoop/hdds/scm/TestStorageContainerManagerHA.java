@@ -32,6 +32,8 @@ import org.apache.hadoop.hdds.scm.server.SCMStorageConfig;
 import org.apache.hadoop.hdds.scm.server.StorageContainerManager;
 import org.apache.hadoop.ozone.MiniOzoneCluster;
 import org.apache.hadoop.ozone.MiniOzoneHAClusterImpl;
+import org.apache.ozone.test.GenericTestUtils;
+import org.apache.ratis.util.ExitUtils;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.slf4j.Logger;
@@ -53,7 +55,6 @@ public class TestStorageContainerManagerHA {
     conf.set(ScmConfigKeys.OZONE_SCM_PIPELINE_CREATION_INTERVAL, "10s");
     conf.set(ScmConfigKeys.OZONE_SCM_HA_DBTRANSACTIONBUFFER_FLUSH_INTERVAL,
         "5s");
-    conf.set(ScmConfigKeys.OZONE_SCM_HA_RATIS_SNAPSHOT_GAP, "1");
     cluster = MiniOzoneCluster.newHABuilder(conf)
         .setOMServiceId("om-service-test1")
         .setSCMServiceId("scm-service-test1")
@@ -67,6 +68,25 @@ public class TestStorageContainerManagerHA {
   public void shutdown() {
     if (cluster != null) {
       cluster.shutdown();
+    }
+  }
+
+  @Test
+  public void testDecommissionSCMTerminatesWithSuccessStatus() throws Exception {
+    ExitUtils.disableSystemExit();
+    ExitUtils.clear();
+    try {
+      init();
+      StorageContainerManager leader = cluster.getScmLeader(true);
+      StorageContainerManager removed = cluster.getStorageContainerManagers().stream()
+          .filter(scm -> scm != leader).findFirst().orElseThrow(IllegalStateException::new);
+      assertTrue(cluster.getStorageContainerLocationClient().decommissionScm(removed.getScmId()).getSuccess());
+      GenericTestUtils.waitFor(ExitUtils::isTerminated, 100, 120_000);
+      assertEquals(0, ExitUtils.getFirstExitException().getStatus());
+      assertTrue(removed.isStopped());
+    } finally {
+      shutdown();
+      ExitUtils.clear();
     }
   }
 

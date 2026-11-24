@@ -21,20 +21,32 @@ on:
       - 'dependabot/**'
     tags:
       - '**'
+    paths:
+      - '.github/workflows/**'
+      - '.github/zizmor.yml'
   pull_request:
+    paths:
+      - '.github/workflows/**'
+      - '.github/zizmor.yml'
 
 permissions: { }
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || case(github.repository_owner == 'apache', github.sha, github.ref_name) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.repository_owner != 'apache' }}
+
 jobs:
   zizmor:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       security-events: write
     steps:
     - name: Checkout project
-      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      uses: actions/checkout@v7
       with:
         persist-credentials: false
 
     - name: Run zizmor
-      uses: zizmorcore/zizmor-action@5f14fd08f7cf1cb1609c1e344975f152c7ee938d # v0.5.6
+      uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
+      with:
+        advanced-security: ${{ github.repository_owner == 'apache' && github.event_name == 'push' }}

@@ -20,10 +20,19 @@ package org.apache.hadoop.ozone.s3.endpoint;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.ByteBuffer;
+import java.security.MessageDigest;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
+import javax.xml.bind.DatatypeConverter;
+import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.ozone.client.io.OzoneOutputStream;
+import org.apache.hadoop.ozone.s3.MultiDigestInputStream;
+import org.apache.hadoop.ozone.s3.SignedChunksInputStream;
+import org.apache.hadoop.ozone.s3.UnsignedChunksInputStream;
+import org.apache.hadoop.ozone.s3.exception.S3ErrorTable;
 import org.apache.ratis.util.function.CheckedRunnable;
 
 /**
@@ -33,15 +42,18 @@ class S3ObjectWriteGuard implements AutoCloseable {
 
   private final OutputStream outputStream;
   private final long expectedLength;
+  private final String keyPath;
   private final List<CheckedRunnable<IOException>> preCommits =
       new ArrayList<>();
   private long writtenLength;
+  private Throwable transferFailure;
 
   S3ObjectWriteGuard(
       OzoneOutputStream outputStream, long expectedLength, String keyPath) {
     this.outputStream = outputStream;
     this.expectedLength = expectedLength;
-    addContentLengthValidation(keyPath);
+    this.keyPath = keyPath;
+    addCommitGuard();
     outputStream.setPreCommits(getPreCommits());
   }
 
@@ -49,12 +61,28 @@ class S3ObjectWriteGuard implements AutoCloseable {
       OutputStream outputStream, long expectedLength, String keyPath) {
     this.outputStream = outputStream;
     this.expectedLength = expectedLength;
-    addContentLengthValidation(keyPath);
+    this.keyPath = keyPath;
+    addCommitGuard();
   }
 
-  private void addContentLengthValidation(String keyPath) {
-    preCommits.add(() -> EndpointBase.validateContentLength(
-        expectedLength, writtenLength, keyPath).run());
+  private void addCommitGuard() {
+    preCommits.add(this::validateBeforeCommit);
+  }
+
+  private void validateBeforeCommit() throws IOException {
+    if (transferFailure != null) {
+      throw new IOException(
+          "S3 object transfer failed before commit: " + keyPath,
+          transferFailure);
+    }
+    EndpointBase.validateContentLength(
+        expectedLength, writtenLength, keyPath).run();
+  }
+
+  private void recordTransferFailure(Throwable failure) {
+    if (transferFailure == null) {
+      transferFailure = failure;
+    }
   }
 
   protected List<CheckedRunnable<IOException>> getPreCommits() {
@@ -65,19 +93,68 @@ class S3ObjectWriteGuard implements AutoCloseable {
     preCommits.add(preCommit);
   }
 
+  void checkContentSha256(MultiDigestInputStream body, String expectedSha256) {
+    // A digest is present only when x-amz-content-sha256 contains a payload hash.
+    MessageDigest sha256Digest = body.getMessageDigest(OzoneConsts.FILE_HASH);
+    if (sha256Digest != null) {
+      final String actualSha256 = DatatypeConverter.printHexBinary(sha256Digest.digest()).toLowerCase();
+      addPreCommit(() -> {
+        if (!expectedSha256.equalsIgnoreCase(actualSha256)) {
+          throw S3ErrorTable.newError(S3ErrorTable.X_AMZ_CONTENT_SHA256_MISMATCH, keyPath);
+        }
+      });
+    }
+  }
+
+  void onKeyOpened(Consumer<ByteBuffer> action) {
+    try {
+      action.accept(getDerivedKey());
+    } catch (RuntimeException ex) {
+      recordTransferFailure(ex);
+      throw ex;
+    }
+  }
+
   long copyFrom(InputStream body, int bufferSize) throws IOException {
     byte[] buffer = new byte[bufferSize];
     while (writtenLength < expectedLength) {
       int toRead = Math.toIntExact(
           Math.min(bufferSize, expectedLength - writtenLength));
-      int readLength = body.read(buffer, 0, toRead);
+      final int readLength;
+      try {
+        readLength = body.read(buffer, 0, toRead);
+      } catch (IOException | RuntimeException ex) {
+        recordTransferFailure(ex);
+        throw ex;
+      }
       if (readLength == -1) {
         break;
       }
-      write(buffer, 0, readLength);
+      try {
+        write(buffer, 0, readLength);
+      } catch (IOException | RuntimeException ex) {
+        recordTransferFailure(ex);
+        throw ex;
+      }
       writtenLength += readLength;
     }
+    try {
+      verifyChunksComplete(body);
+    } catch (IOException | RuntimeException ex) {
+      recordTransferFailure(ex);
+      throw ex;
+    }
     return writtenLength;
+  }
+
+  private static void verifyChunksComplete(InputStream body) throws IOException {
+    InputStream chunks = body instanceof MultiDigestInputStream
+        ? ((MultiDigestInputStream) body).getWrappedStream() : body;
+    if (chunks instanceof SignedChunksInputStream) {
+      ((SignedChunksInputStream) chunks).verifyComplete();
+    } else if (chunks instanceof UnsignedChunksInputStream) {
+      ((UnsignedChunksInputStream) chunks).verifyComplete();
+    }
   }
 
   protected void write(byte[] buffer, int offset, int length)
@@ -87,6 +164,11 @@ class S3ObjectWriteGuard implements AutoCloseable {
 
   public Map<String, String> getMetadata() {
     return ((OzoneOutputStream) outputStream).getMetadata();
+  }
+
+  /** @return the signing key OM derived for chunk verification, or null. */
+  public ByteBuffer getDerivedKey() {
+    return ((OzoneOutputStream) outputStream).getDerivedKey();
   }
 
   @Override

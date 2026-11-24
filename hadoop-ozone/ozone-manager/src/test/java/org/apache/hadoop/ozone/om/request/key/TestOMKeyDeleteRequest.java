@@ -21,11 +21,21 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
+import java.io.IOException;
 import java.util.UUID;
+import org.apache.hadoop.hdds.utils.db.cache.CacheKey;
+import org.apache.hadoop.ozone.OzoneConsts;
+import org.apache.hadoop.ozone.audit.AuditMessage;
+import org.apache.hadoop.ozone.audit.OMAction;
+import org.apache.hadoop.ozone.om.OzoneManager;
 import org.apache.hadoop.ozone.om.exceptions.OMException;
 import org.apache.hadoop.ozone.om.helpers.BucketLayout;
+import org.apache.hadoop.ozone.om.helpers.OMAuditLogger;
 import org.apache.hadoop.ozone.om.helpers.OmKeyInfo;
 import org.apache.hadoop.ozone.om.request.OMRequestTestUtils;
 import org.apache.hadoop.ozone.om.response.OMClientResponse;
@@ -33,15 +43,18 @@ import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.DeleteKeyRequest;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.KeyArgs;
 import org.apache.hadoop.ozone.protocol.proto.OzoneManagerProtocolProtos.OMRequest;
+import org.apache.hadoop.ozone.security.acl.IAccessAuthorizer;
+import org.apache.hadoop.ozone.security.acl.OzoneObj;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.ArgumentCaptor;
 
 /**
  * Tests OmKeyDelete request.
  */
-public class TestOMKeyDeleteRequest extends TestOMKeyRequest {
+public class TestOMKeyDeleteRequest extends OMKeyRequestTests {
 
   @ParameterizedTest
   @ValueSource(strings = {"keyName", "a/b/keyName", "a/.snapshot/keyName", "a.snapshot/b/keyName"})
@@ -69,6 +82,37 @@ public class TestOMKeyDeleteRequest extends TestOMKeyRequest {
   }
 
   @Test
+  public void preExecutePermissionDeniedWhenAclEnabled() throws Exception {
+    when(ozoneManager.getAclsEnabled()).thenReturn(true);
+    OMKeyDeleteRequest req = createDeniedDeleteRequest();
+
+    OMException e = assertThrows(OMException.class, () -> req.preExecute(ozoneManager));
+    assertEquals(OMException.ResultCodes.PERMISSION_DENIED, e.getResult());
+
+    OMAuditLogger.log(req.getAuditBuilder());
+    ArgumentCaptor<AuditMessage> captor = ArgumentCaptor.forClass(AuditMessage.class);
+    verify(auditLogger).logWrite(captor.capture());
+    AuditMessage message = captor.getValue();
+    assertEquals(OMAction.DELETE_KEY.getAction(), message.getOp());
+    assertSame(e, message.getThrowable());
+  }
+
+  /**
+   * Creates a delete request whose ACL check always throws PERMISSION_DENIED.
+   * Subclasses should override to use the layout-appropriate request class.
+   */
+  protected OMKeyDeleteRequest createDeniedDeleteRequest() {
+    return new OMKeyDeleteRequest(createDeleteKeyRequest(), getBucketLayout()) {
+      @Override
+      protected void checkKeyAcls(OzoneManager ozoneManager, String volume,
+          String bucket, String key, IAccessAuthorizer.ACLType aclType,
+          OzoneObj.ResourceType type) throws IOException {
+        throw new OMException("denied", OMException.ResultCodes.PERMISSION_DENIED);
+      }
+    };
+  }
+
+  @Test
   public void testValidateAndUpdateCache() throws Exception {
     // Add volume, bucket and key entries to OM DB.
     OMRequestTestUtils.addVolumeAndBucketToDB(volumeName, bucketName,
@@ -88,6 +132,12 @@ public class TestOMKeyDeleteRequest extends TestOMKeyRequest {
     OMKeyDeleteRequest omKeyDeleteRequest =
             getOmKeyDeleteRequest(modifiedOmRequest);
 
+    // The key was added straight to the table, so charge the bucket for it here; the delete
+    // releases it on a copy that only reaches the cache if the request publishes it.
+    String bucketKey = omMetadataManager.getBucketKey(volumeName, bucketName);
+    omMetadataManager.getBucketTable().getCacheValue(new CacheKey<>(bucketKey))
+        .getCacheValue().incrUsedNamespace(1L);
+
     OMClientResponse omClientResponse =
         omKeyDeleteRequest.validateAndUpdateCache(ozoneManager, 100L);
 
@@ -98,6 +148,7 @@ public class TestOMKeyDeleteRequest extends TestOMKeyRequest {
     omKeyInfo = omMetadataManager.getKeyTable(getBucketLayout()).get(ozoneKey);
 
     assertNull(omKeyInfo);
+    assertEquals(0, omMetadataManager.getBucketTable().get(bucketKey).getUsedNamespace());
   }
 
   @Test
@@ -145,6 +196,109 @@ public class TestOMKeyDeleteRequest extends TestOMKeyRequest {
             omClientResponse.getOMResponse().getStatus());
   }
 
+  @Test
+  public void testValidateAndUpdateCacheWithExpectedETagSuccess()
+      throws Exception {
+    OMRequestTestUtils.addVolumeAndBucketToDB(volumeName, bucketName,
+        omMetadataManager, getBucketLayout());
+
+    String ozoneKey = addKeyToTableWithETag("matching-etag");
+
+    OMRequest modifiedOmRequest =
+        doPreExecute(createDeleteKeyRequestWithExpectedETag("matching-etag"));
+    OMKeyDeleteRequest omKeyDeleteRequest =
+        getOmKeyDeleteRequest(modifiedOmRequest);
+
+    OMClientResponse omClientResponse =
+        omKeyDeleteRequest.validateAndUpdateCache(ozoneManager, 100L);
+
+    assertEquals(OzoneManagerProtocolProtos.Status.OK,
+        omClientResponse.getOMResponse().getStatus());
+    assertNull(omMetadataManager.getKeyTable(getBucketLayout()).get(ozoneKey));
+  }
+
+  @Test
+  public void testValidateAndUpdateCacheWithExpectedETagMismatch()
+      throws Exception {
+    OMRequestTestUtils.addVolumeAndBucketToDB(volumeName, bucketName,
+        omMetadataManager, getBucketLayout());
+
+    String ozoneKey = addKeyToTableWithETag("actual-etag");
+
+    OMRequest modifiedOmRequest =
+        doPreExecute(createDeleteKeyRequestWithExpectedETag("expected-etag"));
+    OMKeyDeleteRequest omKeyDeleteRequest =
+        getOmKeyDeleteRequest(modifiedOmRequest);
+
+    OMClientResponse omClientResponse =
+        omKeyDeleteRequest.validateAndUpdateCache(ozoneManager, 100L);
+
+    assertEquals(OzoneManagerProtocolProtos.Status.ETAG_MISMATCH,
+        omClientResponse.getOMResponse().getStatus());
+    assertNotNull(omMetadataManager.getKeyTable(getBucketLayout())
+        .get(ozoneKey));
+  }
+
+  @Test
+  public void testValidateAndUpdateCacheWithExpectedETagMissingOnKey()
+      throws Exception {
+    OMRequestTestUtils.addVolumeAndBucketToDB(volumeName, bucketName,
+        omMetadataManager, getBucketLayout());
+
+    String ozoneKey = addKeyToTable();
+
+    OMRequest modifiedOmRequest =
+        doPreExecute(createDeleteKeyRequestWithExpectedETag("expected-etag"));
+    OMKeyDeleteRequest omKeyDeleteRequest =
+        getOmKeyDeleteRequest(modifiedOmRequest);
+
+    OMClientResponse omClientResponse =
+        omKeyDeleteRequest.validateAndUpdateCache(ozoneManager, 100L);
+
+    assertEquals(OzoneManagerProtocolProtos.Status.ETAG_NOT_AVAILABLE,
+        omClientResponse.getOMResponse().getStatus());
+    assertNotNull(omMetadataManager.getKeyTable(getBucketLayout())
+        .get(ozoneKey));
+  }
+
+  @Test
+  public void testValidateAndUpdateCacheWithExpectedWildcardETag()
+      throws Exception {
+    OMRequestTestUtils.addVolumeAndBucketToDB(volumeName, bucketName,
+        omMetadataManager, getBucketLayout());
+
+    String ozoneKey = addKeyToTable();
+
+    OMRequest modifiedOmRequest =
+        doPreExecute(createDeleteKeyRequestWithExpectedETag("*"));
+    OMKeyDeleteRequest omKeyDeleteRequest =
+        getOmKeyDeleteRequest(modifiedOmRequest);
+
+    OMClientResponse omClientResponse =
+        omKeyDeleteRequest.validateAndUpdateCache(ozoneManager, 100L);
+
+    assertEquals(OzoneManagerProtocolProtos.Status.ETAG_NOT_AVAILABLE,
+        omClientResponse.getOMResponse().getStatus());
+    assertNotNull(omMetadataManager.getKeyTable(getBucketLayout())
+        .get(ozoneKey));
+  }
+
+  @Test
+  public void testValidateAndUpdateCacheWithExpectedWildcardETagKeyNotFound()
+      throws Exception {
+    OMRequestTestUtils.addVolumeAndBucketToDB(volumeName, bucketName,
+        omMetadataManager, getBucketLayout());
+
+    OMKeyDeleteRequest omKeyDeleteRequest =
+        getOmKeyDeleteRequest(createDeleteKeyRequest("missing-key", "*"));
+
+    OMClientResponse omClientResponse =
+        omKeyDeleteRequest.validateAndUpdateCache(ozoneManager, 100L);
+
+    assertEquals(OzoneManagerProtocolProtos.Status.KEY_NOT_FOUND,
+        omClientResponse.getOMResponse().getStatus());
+  }
+
   /**
    * This method calls preExecute and verify the modified request.
    * @param originalOmRequest
@@ -173,8 +327,21 @@ public class TestOMKeyDeleteRequest extends TestOMKeyRequest {
   }
 
   protected OMRequest createDeleteKeyRequest(String testKeyName) {
-    KeyArgs keyArgs = KeyArgs.newBuilder().setBucketName(bucketName)
-        .setVolumeName(volumeName).setKeyName(testKeyName).build();
+    return createDeleteKeyRequest(testKeyName, null);
+  }
+
+  protected OMRequest createDeleteKeyRequestWithExpectedETag(
+      String expectedETag) {
+    return createDeleteKeyRequest(keyName, expectedETag);
+  }
+
+  protected OMRequest createDeleteKeyRequest(
+      String testKeyName, String expectedETag) {
+    KeyArgs.Builder keyArgs = KeyArgs.newBuilder().setBucketName(bucketName)
+        .setVolumeName(volumeName).setKeyName(testKeyName);
+    if (expectedETag != null) {
+      keyArgs.setExpectedETag(expectedETag);
+    }
 
     DeleteKeyRequest deleteKeyRequest =
         DeleteKeyRequest.newBuilder().setKeyArgs(keyArgs).build();
@@ -194,6 +361,16 @@ public class TestOMKeyDeleteRequest extends TestOMKeyRequest {
         omMetadataManager);
 
     return omMetadataManager.getOzoneKey(volumeName, bucketName, key);
+  }
+
+  protected String addKeyToTableWithETag(String eTag) throws Exception {
+    String ozoneKey = addKeyToTable();
+    OmKeyInfo omKeyInfo = omMetadataManager.getKeyTable(getBucketLayout())
+        .get(ozoneKey);
+    omMetadataManager.getKeyTable(getBucketLayout()).put(ozoneKey,
+        omKeyInfo.withMetadataMutations(
+            metadata -> metadata.put(OzoneConsts.ETAG, eTag)));
+    return ozoneKey;
   }
 
   protected OMKeyDeleteRequest getOmKeyDeleteRequest(

@@ -32,6 +32,7 @@ import org.apache.hadoop.hdds.client.ReplicationConfig;
 import org.apache.hadoop.hdds.scm.container.common.helpers.ExcludeList;
 import org.apache.hadoop.hdds.utils.db.cache.CacheKey;
 import org.apache.hadoop.hdds.utils.db.cache.CacheValue;
+import org.apache.hadoop.ozone.ClientVersion;
 import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.ozone.audit.AuditLogger;
 import org.apache.hadoop.ozone.audit.OMAction;
@@ -91,11 +92,8 @@ public class OMAllocateBlockRequest extends OMKeyRequest {
     keyPath = validateAndNormalizeKey(ozoneManager.getEnableFileSystemPaths(),
         keyPath, getBucketLayout());
 
-    ExcludeList excludeList = new ExcludeList();
-    if (allocateBlockRequest.hasExcludeList()) {
-      excludeList =
-          ExcludeList.getFromProtoBuf(allocateBlockRequest.getExcludeList());
-    }
+    final ExcludeList excludeList = !allocateBlockRequest.hasExcludeList() ? new ExcludeList()
+        : ExcludeList.getFromProtoBuf(allocateBlockRequest.getExcludeList());
 
     // TODO: Here we are allocating block with out any check for key exist in
     //  open table or not and also with out any authorization checks.
@@ -111,14 +109,8 @@ public class OMAllocateBlockRequest extends OMKeyRequest {
     // To allocate atleast one block passing requested size and scmBlockSize
     // as same value. When allocating block requested size is same as
     // scmBlockSize.
-    List<OmKeyLocationInfo> omKeyLocationInfoList =
-        allocateBlock(ozoneManager.getScmClient(),
-            ozoneManager.getBlockTokenSecretManager(), repConfig, excludeList,
-            ozoneManager.getScmBlockSize(), ozoneManager.getScmBlockSize(),
-            ozoneManager.getPreallocateBlocksMax(),
-            ozoneManager.isGrpcBlockTokenEnabled(),
-            ozoneManager.getOMServiceId(), ozoneManager.getMetrics(),
-            keyArgs.getSortDatanodes(), userInfo);
+    final List<OmKeyLocationInfo> omKeyLocationInfoList = allocateBlock(repConfig, excludeList,
+        ozoneManager.getScmBlockSize(), keyArgs.getSortDatanodes(), userInfo, ozoneManager);
 
     // Set modification time and normalize key if required.
     KeyArgs.Builder newKeyArgs =
@@ -140,7 +132,8 @@ public class OMAllocateBlockRequest extends OMKeyRequest {
 
     // Add allocated block info.
     newAllocatedBlockRequest.setKeyLocation(
-        omKeyLocationInfoList.get(0).getProtobuf(getOmRequest().getVersion()));
+        omKeyLocationInfoList.get(0).getProtobuf(
+            ClientVersion.deserialize(getOmRequest().getVersion())));
 
     return getOmRequest().toBuilder().setUserInfo(userInfo)
         .setAllocateBlockRequest(newAllocatedBlockRequest).build();
@@ -225,7 +218,7 @@ public class OMAllocateBlockRequest extends OMKeyRequest {
       long preAllocatedKeySize = newLocationList.size()
           * ozoneManager.getScmBlockSize();
       long hadAllocatedKeySize =
-          openKeyInfo.getLatestVersionLocations().getLocationList().size()
+          openKeyInfo.getLatestVersionLocations().getLocationListCount()
               * ozoneManager.getScmBlockSize();
       ReplicationConfig repConfig = openKeyInfo.getReplicationConfig();
       long totalAllocatedSpace = QuotaUtil.getReplicatedSize(

@@ -29,11 +29,13 @@ import java.io.IOException;
 import java.time.Clock;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentNavigableMap;
 import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.ConcurrentSkipListSet;
@@ -42,6 +44,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.ToLongFunction;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerDataProto.State;
+import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.ContainerAction;
 import org.apache.hadoop.hdds.protocol.proto.StorageContainerDatanodeProtocolProtos.ContainerReportsProto;
 import org.apache.hadoop.hdds.scm.container.ContainerID;
 import org.apache.hadoop.hdds.scm.container.common.helpers.StorageContainerException;
@@ -73,8 +76,8 @@ public class ContainerSet implements Iterable<Container<?>> {
       ConcurrentSkipListMap<>();
   private final ConcurrentSkipListSet<Long> missingContainerSet =
       new ConcurrentSkipListSet<>();
-  private final ConcurrentSkipListMap<Long, Long> recoveringContainerMap =
-      new ConcurrentSkipListMap<>();
+
+  private final ConcurrentHashMap<Long, Long> recoveringContainerMap = new ConcurrentHashMap<>();
   private final Clock clock;
   private long recoveringTimeout;
   @Nullable
@@ -208,8 +211,7 @@ public class ContainerSet implements Iterable<Container<?>> {
       updateContainerIdTable(containerId, container.getContainerData());
       missingContainerSet.remove(containerId);
       if (container.getContainerData().getState() == RECOVERING) {
-        recoveringContainerMap.put(
-            clock.millis() + recoveringTimeout, containerId);
+        recoveringContainerMap.put(containerId, getCurrentTime() + recoveringTimeout);
       }
       HddsVolume volume = container.getContainerData().getVolume();
       if (volume != null) {
@@ -367,7 +369,7 @@ public class ContainerSet implements Iterable<Container<?>> {
   }
 
   /**
-   * Removes the Container matching with specified containerId.
+   * Removes the container matching the specified containerId and its recovering entry, if present.
    * @param containerId ID of the container to remove
    * @return If container is removed from containerMap returns true, otherwise
    * false
@@ -382,6 +384,7 @@ public class ContainerSet implements Iterable<Container<?>> {
     if (markMissing) {
       missingContainerSet.add(containerId);
     }
+    removeRecoveringContainer(containerId);
     Container<?> removed = containerMap.remove(containerId);
     if (removeFromDB) {
       deleteFromContainerTable(containerId);
@@ -420,22 +423,20 @@ public class ContainerSet implements Iterable<Container<?>> {
   public boolean removeRecoveringContainer(long containerId) {
     Preconditions.checkState(containerId >= 0,
         "Container Id cannot be negative.");
-    //it might take a little long time to iterate all the entries
-    // in recoveringContainerMap, but it seems ok here since:
-    // 1 In the vast majority of cases，there will not be too
-    // many recovering containers.
-    // 2 closing container is not a sort of urgent action
-    //
-    // we can revisit here if any performance problem happens
-    Iterator<Map.Entry<Long, Long>> it = getRecoveringContainerIterator();
-    while (it.hasNext()) {
-      Map.Entry<Long, Long> entry = it.next();
-      if (entry.getValue() == containerId) {
-        it.remove();
-        return true;
-      }
-    }
-    return false;
+    return recoveringContainerMap.remove(containerId) != null;
+  }
+
+  /**
+   * Reset the stale recovering scrub deadline for an active RECOVERING container.
+   */
+  public void updateRecoveringContainerTimeout(long containerId) {
+    Preconditions.checkState(containerId >= 0, "Container Id cannot be negative.");
+    recoveringContainerMap.put(containerId, getCurrentTime() + recoveringTimeout);
+  }
+
+  @VisibleForTesting
+  public Map<Long, Long> getRecoveringContainerMap() {
+    return recoveringContainerMap;
   }
 
   /**
@@ -456,9 +457,20 @@ public class ContainerSet implements Iterable<Container<?>> {
   public void handleVolumeFailures(StateContext context) throws StorageContainerException {
     AtomicBoolean failedVolume = new AtomicBoolean(false);
     AtomicInteger containerCount = new AtomicInteger(0);
+    AtomicInteger openEcCount = new AtomicInteger(0);
     for (Container<?> c : containerMap.values()) {
       ContainerData data = c.getContainerData();
       if (data.getVolume().isFailed()) {
+        if (data.getReplicaIndex() > 0 && data.isOpen()) {
+          // An open Ratis container's pipeline is closed when its next write fails. Nothing does that for an open
+          // EC container, so SCM would keep allocating it: ask SCM to close it.
+          context.addContainerActionIfAbsent(ContainerAction.newBuilder()
+              .setContainerID(data.getContainerID())
+              .setAction(ContainerAction.Action.CLOSE)
+              .setReason(ContainerAction.Reason.CONTAINER_UNHEALTHY)
+              .build());
+          openEcCount.incrementAndGet();
+        }
         removeMissingContainer(data.getContainerID());
         LOG.debug("Removing Container {} as the Volume {} " +
             "has failed", data.getContainerID(), data.getVolume());
@@ -470,8 +482,8 @@ public class ContainerSet implements Iterable<Container<?>> {
 
     if (failedVolume.get()) {
       try {
-        LOG.info("Removed {} containers on failed volumes",
-            containerCount.get());
+        LOG.info("Removed {} containers on failed volumes, asked SCM to close {} open EC containers among them",
+            containerCount.get(), openEcCount.get());
         // There are some failed volume(container), send FCR to SCM
         Message report = context.getFullContainerReportDiscardPendingICR();
         context.refreshFullReport(report);
@@ -485,15 +497,6 @@ public class ContainerSet implements Iterable<Container<?>> {
   @Override
   public Iterator<Container<?>> iterator() {
     return containerMap.values().iterator();
-  }
-
-  /**
-   * Return an container Iterator over
-   * {@link ContainerSet#recoveringContainerMap}.
-   * @return {@literal Iterator<Container<?>>}
-   */
-  public Iterator<Map.Entry<Long, Long>> getRecoveringContainerIterator() {
-    return recoveringContainerMap.entrySet().iterator();
   }
 
   /**
@@ -529,6 +532,29 @@ public class ContainerSet implements Iterable<Container<?>> {
   public long containerCount(HddsVolume volume) {
     Objects.requireNonNull(volume, "volume == null");
     return volume.getContainerCount();
+  }
+
+  /**
+   * Count the OPEN containers on each storage volume, keyed by volume storageID.
+   * Used by the node report so Recon can show open-container distribution per disk.
+   *
+   * @return map of volume storageID to its OPEN container count
+   */
+  public Map<String, Long> getOpenContainerCountsByVolume() {
+    Map<String, Long> counts = new HashMap<>();
+    Iterator<Map.Entry<Long, Container<?>>> iterator = getContainerMapIterator();
+    while (iterator.hasNext()) {
+      Container<?> container = iterator.next().getValue();
+      if (container.getContainerState() != State.OPEN) {
+        continue;
+      }
+      HddsVolume volume = container.getContainerData().getVolume();
+      if (volume == null) {
+        continue;
+      }
+      counts.merge(volume.getStorageID(), 1L, Long::sum);
+    }
+    return counts;
   }
 
   /**

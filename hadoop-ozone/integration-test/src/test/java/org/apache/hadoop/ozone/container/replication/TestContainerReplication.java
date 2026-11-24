@@ -27,7 +27,6 @@ import static org.apache.ozone.test.GenericTestUtils.waitFor;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 
-import com.google.common.collect.ImmutableList;
 import java.io.IOException;
 import java.time.Duration;
 import java.util.List;
@@ -41,7 +40,6 @@ import org.apache.hadoop.hdds.client.BlockID;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.conf.StorageUnit;
 import org.apache.hadoop.hdds.protocol.DatanodeDetails;
-import org.apache.hadoop.hdds.protocol.DatanodeDetails.Port;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos;
 import org.apache.hadoop.hdds.scm.ScmConfigKeys;
 import org.apache.hadoop.hdds.scm.XceiverClientFactory;
@@ -53,6 +51,7 @@ import org.apache.hadoop.ozone.HddsDatanodeService;
 import org.apache.hadoop.ozone.MiniOzoneCluster;
 import org.apache.hadoop.ozone.OzoneConfigKeys;
 import org.apache.hadoop.ozone.container.ContainerTestHelper;
+import org.apache.hadoop.ozone.container.common.ContainerTestUtils;
 import org.apache.hadoop.ozone.container.common.interfaces.Container;
 import org.apache.hadoop.ozone.container.common.interfaces.DBHandle;
 import org.apache.hadoop.ozone.container.common.statemachine.DatanodeStateMachine;
@@ -116,48 +115,10 @@ class TestContainerReplication {
     long containerID = createNewClosedContainer(source);
     DatanodeDetails target = selectOtherNode(source);
     ReplicateContainerCommand cmd =
-        ReplicateContainerCommand.toTarget(containerID, target);
+        ContainerTestUtils.getReplicateContainerCommand(containerID, target);
 
     queueAndWaitForCompletion(cmd, source,
         ReplicationSupervisor::getReplicationSuccessCount);
-  }
-
-  @ParameterizedTest
-  @EnumSource
-  void testPull(CopyContainerCompression compression) throws Exception {
-    final int index = compression.ordinal();
-    DatanodeDetails target = cluster.getHddsDatanodes().get(index)
-        .getDatanodeDetails();
-    DatanodeDetails source = selectOtherNode(target);
-    long containerID = createNewClosedContainer(source);
-    ReplicateContainerCommand cmd =
-        ReplicateContainerCommand.fromSources(containerID,
-            ImmutableList.of(source));
-
-    queueAndWaitForCompletion(cmd, target,
-        ReplicationSupervisor::getReplicationSuccessCount);
-  }
-
-  /**
-   * Replication fails because target tries to pull the container from wrong
-   * port at source datanode.
-   */
-  @Test
-  void targetPullsFromWrongService() throws Exception {
-    DatanodeDetails source = cluster.getHddsDatanodes().get(0)
-        .getDatanodeDetails();
-    DatanodeDetails target = cluster.getHddsDatanodes().get(1)
-        .getDatanodeDetails();
-    long containerID = createNewClosedContainer(source);
-    DatanodeDetails invalidPort = new DatanodeDetails(source);
-    invalidPort.setPort(Port.Name.REPLICATION,
-        source.getStandalonePort().getValue());
-    ReplicateContainerCommand cmd =
-        ReplicateContainerCommand.fromSources(containerID,
-            ImmutableList.of(invalidPort));
-
-    queueAndWaitForCompletion(cmd, target,
-        ReplicationSupervisor::getReplicationFailureCount);
   }
 
   /**
@@ -176,7 +137,7 @@ class TestContainerReplication {
     poisonBytesUsed(source, containerID, containerSize);
 
     ReplicateContainerCommand cmd =
-        ReplicateContainerCommand.toTarget(containerID, target);
+        ContainerTestUtils.getReplicateContainerCommand(containerID, target);
 
     queueAndWaitForCompletion(cmd, source,
         ReplicationSupervisor::getReplicationSuccessCount);
@@ -217,8 +178,7 @@ class TestContainerReplication {
         .getDatanodeDetails();
     DatanodeDetails target = selectOtherNode(source);
     ReplicateContainerCommand cmd =
-        ReplicateContainerCommand.toTarget(CONTAINER_ID.incrementAndGet(),
-            target);
+        ContainerTestUtils.getReplicateContainerCommand(CONTAINER_ID.incrementAndGet(), target);
 
     queueAndWaitForCompletion(cmd, source,
         ReplicationSupervisor::getReplicationFailureCount);
@@ -263,8 +223,7 @@ class TestContainerReplication {
     assertEquals(originalSize, containerSize);
     
     // Create replication command to push container to target
-    ReplicateContainerCommand cmd =
-        ReplicateContainerCommand.toTarget(containerID, target);
+    ReplicateContainerCommand cmd = ContainerTestUtils.getReplicateContainerCommand(containerID, target);
 
     // Execute push replication
     queueAndWaitForCompletion(cmd, source,

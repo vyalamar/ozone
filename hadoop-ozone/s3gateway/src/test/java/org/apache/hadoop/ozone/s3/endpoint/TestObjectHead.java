@@ -19,14 +19,28 @@ package org.apache.hadoop.ozone.s3.endpoint;
 
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.apache.hadoop.ozone.s3.S3GatewayConfigKeys.OZONE_S3G_FSO_DIRECTORY_CREATION_ENABLED;
+import static org.apache.hadoop.ozone.s3.endpoint.EndpointBase.CACHE_CONTROL_CUSTOM;
+import static org.apache.hadoop.ozone.s3.endpoint.EndpointBase.CONTENT_DISPOSITION_CUSTOM;
+import static org.apache.hadoop.ozone.s3.endpoint.EndpointBase.CONTENT_ENCODING_CUSTOM;
+import static org.apache.hadoop.ozone.s3.endpoint.EndpointBase.CONTENT_LANGUAGE_CUSTOM;
+import static org.apache.hadoop.ozone.s3.endpoint.EndpointBase.CONTENT_TYPE_CUSTOM;
+import static org.apache.hadoop.ozone.s3.endpoint.EndpointBase.EXPIRES_CUSTOM;
 import static org.apache.hadoop.ozone.s3.endpoint.EndpointTestUtils.assertErrorResponse;
 import static org.apache.hadoop.ozone.s3.endpoint.EndpointTestUtils.assertStatus;
 import static org.apache.hadoop.ozone.s3.endpoint.EndpointTestUtils.assertSucceeds;
 import static org.apache.hadoop.ozone.s3.endpoint.EndpointTestUtils.put;
+import static org.apache.hadoop.ozone.s3.endpoint.TestObjectGet.EXPIRES1;
+import static org.apache.hadoop.ozone.s3.exception.S3ErrorTable.INVALID_ARGUMENT;
+import static org.apache.hadoop.ozone.s3.exception.S3ErrorTable.INVALID_RANGE;
 import static org.apache.hadoop.ozone.s3.exception.S3ErrorTable.PRECOND_FAILED;
+import static org.apache.hadoop.ozone.s3.util.S3Consts.ACCEPT_RANGE_HEADER;
+import static org.apache.hadoop.ozone.s3.util.S3Consts.CONTENT_RANGE_HEADER;
+import static org.apache.hadoop.ozone.s3.util.S3Consts.CUSTOM_METADATA_HEADER_PREFIX;
 import static org.apache.hadoop.ozone.s3.util.S3Consts.IF_MATCH_HEADER;
 import static org.apache.hadoop.ozone.s3.util.S3Consts.IF_NONE_MATCH_HEADER;
 import static org.apache.hadoop.ozone.s3.util.S3Consts.IF_UNMODIFIED_SINCE_HEADER;
+import static org.apache.hadoop.ozone.s3.util.S3Consts.RANGE_HEADER;
+import static org.apache.hadoop.ozone.s3.util.S3Consts.RANGE_HEADER_SUPPORTED_UNIT;
 import static org.apache.hadoop.ozone.s3.util.S3Consts.TAG_COUNT_HEADER;
 import static org.apache.hadoop.ozone.s3.util.S3Consts.TAG_HEADER;
 import static org.apache.hadoop.ozone.s3.util.S3Consts.X_AMZ_CONTENT_SHA256;
@@ -41,7 +55,10 @@ import java.io.OutputStream;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.stream.Stream;
 import javax.ws.rs.core.HttpHeaders;
+import javax.ws.rs.core.MultivaluedHashMap;
+import javax.ws.rs.core.MultivaluedMap;
 import javax.ws.rs.core.Response;
 import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
@@ -49,16 +66,24 @@ import org.apache.hadoop.ozone.OzoneConsts;
 import org.apache.hadoop.ozone.client.OzoneBucket;
 import org.apache.hadoop.ozone.client.OzoneClient;
 import org.apache.hadoop.ozone.client.OzoneClientStub;
+import org.apache.hadoop.ozone.s3.HeaderPreprocessor;
 import org.apache.hadoop.ozone.s3.exception.OS3Exception;
 import org.apache.hadoop.ozone.s3.util.RFC1123Util;
+import org.apache.hadoop.ozone.s3.util.S3Consts;
 import org.apache.http.HttpStatus;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.Arguments;
+import org.junit.jupiter.params.provider.MethodSource;
 
 /**
  * Test head object.
  */
 public class TestObjectHead {
+  private static final String RANGE_KEY = "range-key";
+  private static final String RANGE_CONTENT = "0123456789";
+
   private String bucketName = "b1";
   private ObjectEndpoint keyEndpoint;
   private OzoneBucket bucket;
@@ -102,6 +127,61 @@ public class TestObjectHead {
   @Test
   public void testHeadFailByBadName() throws Exception {
     assertStatus(HttpStatus.SC_NOT_FOUND, () -> keyEndpoint.head(bucketName, "badKeyName"));
+  }
+
+  @Test
+  public void testHeadWithNegativePartNumber() throws Exception {
+    keyEndpoint.queryParamsForTest()
+        .setInt(S3Consts.QueryParams.PART_NUMBER, -1);
+    assertErrorResponse(INVALID_ARGUMENT,
+        () -> keyEndpoint.head(bucketName, "key1"));
+  }
+
+  @ParameterizedTest
+  @MethodSource("rangeCases")
+  public void testHeadWithRange(String range, int expectedStatus, long expectedLength, String expectedContentRange)
+      throws Exception {
+    assertSucceeds(() -> put(keyEndpoint, bucketName, RANGE_KEY, RANGE_CONTENT));
+    when(headers.getHeaderString(RANGE_HEADER)).thenReturn(range);
+
+    Response response = keyEndpoint.head(bucketName, RANGE_KEY);
+
+    assertEquals(expectedStatus, response.getStatus());
+    assertEquals(expectedLength, Long.parseLong(response.getHeaderString(HttpHeaders.CONTENT_LENGTH)));
+    assertEquals(expectedContentRange, response.getHeaderString(CONTENT_RANGE_HEADER));
+    assertEquals(RANGE_HEADER_SUPPORTED_UNIT, response.getHeaderString(ACCEPT_RANGE_HEADER));
+    assertNotNull(response.getHeaderString(HttpHeaders.ETAG));
+  }
+
+  @Test
+  public void testHeadWithInvalidRange() throws Exception {
+    assertSucceeds(() -> put(keyEndpoint, bucketName, RANGE_KEY, RANGE_CONTENT));
+    when(headers.getHeaderString(RANGE_HEADER)).thenReturn("bytes=10-20");
+    long failureBefore = keyEndpoint.getMetrics().getHeadKeyFailure();
+
+    assertErrorResponse(INVALID_RANGE, () -> keyEndpoint.head(bucketName, RANGE_KEY));
+    assertEquals(1L, keyEndpoint.getMetrics().getHeadKeyFailure() - failureBefore);
+  }
+
+  @Test
+  public void testHeadIfNoneMatchTakesPrecedenceOverRange() throws Exception {
+    assertSucceeds(() -> put(keyEndpoint, bucketName, RANGE_KEY, RANGE_CONTENT));
+    String eTag = keyEndpoint.head(bucketName, RANGE_KEY).getHeaderString(HttpHeaders.ETAG);
+    when(headers.getHeaderString(IF_NONE_MATCH_HEADER)).thenReturn(eTag);
+    when(headers.getHeaderString(RANGE_HEADER)).thenReturn("bytes=10-20");
+
+    Response response = keyEndpoint.head(bucketName, RANGE_KEY);
+
+    assertEquals(Response.Status.NOT_MODIFIED.getStatusCode(), response.getStatus());
+  }
+
+  @Test
+  public void testHeadIfMatchFailureTakesPrecedenceOverRange() throws Exception {
+    assertSucceeds(() -> put(keyEndpoint, bucketName, RANGE_KEY, RANGE_CONTENT));
+    when(headers.getHeaderString(IF_MATCH_HEADER)).thenReturn("\"mismatched-etag\"");
+    when(headers.getHeaderString(RANGE_HEADER)).thenReturn("bytes=10-20");
+
+    assertErrorResponse(PRECOND_FAILED, () -> keyEndpoint.head(bucketName, RANGE_KEY));
   }
 
   @Test
@@ -229,6 +309,85 @@ public class TestObjectHead {
     assertNotNull(response.getHeaderString(TAG_COUNT_HEADER),
         "HeadObject must include x-amz-tagging-count when object has tags (AWS TagCount)");
     assertEquals("2", response.getHeaderString(TAG_COUNT_HEADER));
+  }
+
+  @ParameterizedTest
+  @MethodSource("reservedMetadataCollisionCases")
+  public void testHeadSeparatesUserMetadataFromSystemHeader(
+      String headerName, String customKey, String systemValue, String userValue)
+      throws Exception {
+    String keyName = "reserved-" + customKey;
+    MultivaluedMap<String, String> requestHeaders = new MultivaluedHashMap<>();
+    requestHeaders.putSingle(CUSTOM_METADATA_HEADER_PREFIX + headerName.toLowerCase(), userValue);
+    when(headers.getRequestHeaders()).thenReturn(requestHeaders);
+    if (HttpHeaders.CONTENT_TYPE.equals(headerName)) {
+      when(headers.getHeaderString(HeaderPreprocessor.ORIGINAL_CONTENT_TYPE))
+          .thenReturn(systemValue);
+    } else {
+      when(headers.getHeaderString(headerName)).thenReturn(systemValue);
+    }
+
+    assertSucceeds(() -> put(keyEndpoint, bucketName, keyName, "body"));
+
+    assertEquals(systemValue, bucket.getKey(keyName).getMetadata().get(headerName));
+    assertEquals(userValue,
+        bucket.getKey(keyName).getMetadata().get(customKey));
+
+    Response response = keyEndpoint.head(bucketName, keyName);
+    assertEquals(HttpStatus.SC_OK, response.getStatus());
+    assertEquals(systemValue, response.getHeaderString(headerName));
+    assertEquals(userValue,
+        response.getHeaderString(CUSTOM_METADATA_HEADER_PREFIX + headerName.toLowerCase()));
+  }
+
+  @Test
+  public void testUserMetadataSuffixDoesNotCollideWithInternalKey() throws Exception {
+    String keyName = "reserved-cache-control-suffix";
+    MultivaluedMap<String, String> requestHeaders = new MultivaluedHashMap<>();
+    requestHeaders.putSingle(CUSTOM_METADATA_HEADER_PREFIX + "cache-control", "user-cache");
+    requestHeaders.putSingle(CUSTOM_METADATA_HEADER_PREFIX + "cache-control-custom", "suffix-value");
+    when(headers.getRequestHeaders()).thenReturn(requestHeaders);
+    when(headers.getHeaderString(HttpHeaders.CACHE_CONTROL)).thenReturn("no-cache");
+
+    assertSucceeds(() -> put(keyEndpoint, bucketName, keyName, "body"));
+
+    assertEquals("no-cache",
+        bucket.getKey(keyName).getMetadata().get(HttpHeaders.CACHE_CONTROL));
+    assertEquals("user-cache",
+        bucket.getKey(keyName).getMetadata().get(CACHE_CONTROL_CUSTOM));
+    assertEquals("suffix-value",
+        bucket.getKey(keyName).getMetadata().get("cache-control-custom"));
+
+    Response response = keyEndpoint.head(bucketName, keyName);
+    assertEquals("no-cache", response.getHeaderString(HttpHeaders.CACHE_CONTROL));
+    assertEquals("user-cache",
+        response.getHeaderString(CUSTOM_METADATA_HEADER_PREFIX + "cache-control"));
+    assertEquals("suffix-value",
+        response.getHeaderString(CUSTOM_METADATA_HEADER_PREFIX + "cache-control-custom"));
+  }
+
+  private static Stream<Arguments> reservedMetadataCollisionCases() {
+    return Stream.of(
+        Arguments.of(HttpHeaders.CONTENT_TYPE, CONTENT_TYPE_CUSTOM, "image/jpeg", "user/custom-type"),
+        Arguments.of(HttpHeaders.CACHE_CONTROL, CACHE_CONTROL_CUSTOM, "no-cache", "user-cache"),
+        Arguments.of(HttpHeaders.EXPIRES, EXPIRES_CUSTOM, EXPIRES1, "user-expires"),
+        Arguments.of(HttpHeaders.CONTENT_ENCODING, CONTENT_ENCODING_CUSTOM, "gzip", "user-encoding"),
+        Arguments.of(HttpHeaders.CONTENT_LANGUAGE, CONTENT_LANGUAGE_CUSTOM, "en-CA", "user-lang"),
+        Arguments.of(HttpHeaders.CONTENT_DISPOSITION, CONTENT_DISPOSITION_CUSTOM, "inline", "user-disp"));
+  }
+
+  private static Stream<Arguments> rangeCases() {
+    return Stream.of(
+        Arguments.of(null, HttpStatus.SC_OK, 10L, null),
+        Arguments.of("bytes=0-4", HttpStatus.SC_PARTIAL_CONTENT, 5L, "bytes 0-4/10"),
+        Arguments.of("bytes=5-", HttpStatus.SC_PARTIAL_CONTENT, 5L, "bytes 5-9/10"),
+        Arguments.of("bytes=-3", HttpStatus.SC_PARTIAL_CONTENT, 3L, "bytes 7-9/10"),
+        Arguments.of("bytes=8-20", HttpStatus.SC_PARTIAL_CONTENT, 2L, "bytes 8-9/10"),
+        Arguments.of("bytes=5-2", HttpStatus.SC_OK, 10L, null),
+        Arguments.of("bytes=-", HttpStatus.SC_OK, 10L, null),
+        Arguments.of("bytes=0-" + Long.MAX_VALUE, HttpStatus.SC_PARTIAL_CONTENT, 10L, "bytes 0-9/10"),
+        Arguments.of("bytes=0-9223372036854775808", HttpStatus.SC_OK, 10L, null),
+        Arguments.of("bytes=0-99999999999999999999", HttpStatus.SC_OK, 10L, null));
   }
 
   private byte[] createKey(String keyPath) throws IOException {

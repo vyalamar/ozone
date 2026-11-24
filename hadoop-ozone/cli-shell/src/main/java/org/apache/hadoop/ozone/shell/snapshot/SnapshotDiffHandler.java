@@ -67,7 +67,7 @@ public class SnapshotDiffHandler extends Handler {
           "Note the effective page size will also be bound by " +
           "the server-side page size limit, see config:%n" +
           "  ozone.om.snapshot.diff.max.page.size",
-      defaultValue = "1000",
+      defaultValue = "5000",
       showDefaultValue = CommandLine.Help.Visibility.ALWAYS
   )
   private int pageSize;
@@ -95,6 +95,11 @@ public class SnapshotDiffHandler extends Handler {
           " native libs (optional)",
       hidden = true)
   private boolean diffDisableNativeLibs;
+
+  @CommandLine.Option(names = {"--ordered"},
+      description = "emit FSO snapshot diff report entries in dependency order",
+      defaultValue = "false")
+  private boolean orderedReport;
 
   @CommandLine.Option(names = { "--json" },
       defaultValue = "false",
@@ -129,7 +134,7 @@ public class SnapshotDiffHandler extends Handler {
     SubmitSnapshotDiffResponse response;
     try {
       response = store.submitSnapshotDiff(volumeName, bucketName, fromSnapshot, toSnapshot,
-          forceFullDiff, diffDisableNativeLibs);
+          forceFullDiff, diffDisableNativeLibs, orderedReport);
     } catch (OMException ex) {
       // submit snapshot diff falls back to legacy snapshotDiff is server does not support it.
       if (ex.getResult() == OMException.ResultCodes.NOT_SUPPORTED_OPERATION) {
@@ -180,6 +185,13 @@ public class SnapshotDiffHandler extends Handler {
     }
     if (StringUtils.isNotEmpty(diffResponse.getReason())) {
       diffResponseNode.put("reason", diffResponse.getReason());
+    }
+    if (diffResponse.getSubStatus() != null) {
+      SnapshotDiffResponse.SubStatus sub = diffResponse.getSubStatus();
+      diffResponseNode.put("subStatus", sub.name());
+      if (sub.hasProgress()) {
+        diffResponseNode.put("progressPercent", diffResponse.getProgressPercent());
+      }
     }
     return diffResponseNode;
   }

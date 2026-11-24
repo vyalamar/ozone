@@ -33,7 +33,6 @@ class RDBStoreByteArrayIterator extends RDBStoreAbstractIterator<byte[]> {
       RDBTable table, byte[] prefix, IteratorType type,
       ManagedReadOptions readOptions) {
     super(iterator, table, copyNonEmpty(prefix), type, readOptions);
-    seekToFirst();
   }
 
   @Override

@@ -30,10 +30,10 @@
         templateUrl: 'ratis-events.html',
         controller: function ($http) {
             var ctrl = this;
-            $http.get("jmx?qry=Hadoop:service=StorageContainerManager,name=SCMMetrics")
+            $http.get("jmx?qry=Hadoop:service=StorageContainerManager,name=StorageContainerManagerInfo,component=ServerRuntime")
                 .then(function (result) {
                     var metrics = result.data.beans[0];
-                  var rawEvents = metrics['tag.RatisEvents'] ? metrics['tag.RatisEvents'].split('\n') : [];
+                    var rawEvents = (metrics && metrics['RatisEvents']) ? metrics['RatisEvents'].split('\n') : [];
                     ctrl.events = rawEvents.map(function(e) {
                         var parts = e.split('|');
                         return {
@@ -150,6 +150,7 @@
                                 }
                                 return {
                                     hostname: key,
+                                    urlhost: key.includes(":") ? "[" + key + "]" : key,
                                     opstate: value && value.find((element) => element.key === "OPSTATE").value,
                                     usedspacepercent: value && value.find((element) => element.key === "USEDSPACEPERCENT").value,
                                     capacity: value && value.find((element) => element.key === "CAPACITY").value,

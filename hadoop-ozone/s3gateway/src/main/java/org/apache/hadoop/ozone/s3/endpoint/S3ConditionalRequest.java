@@ -178,15 +178,18 @@ final class S3ConditionalRequest {
       throw ex;
     }
 
-    if (trimmedIfNoneMatch != null
-        && !"*".equals(parseETag(trimmedIfNoneMatch))) {
+    return new WriteConditions(trimmedIfNoneMatch, trimmedIfMatch);
+  }
+
+  static DeleteCondition parseDeleteCondition(HttpHeaders headers, String keyPath)
+      throws OS3Exception {
+    String ifMatch = headers.getHeaderString(S3Consts.IF_MATCH_HEADER);
+    if (ifMatch != null && StringUtils.isBlank(ifMatch)) {
       OS3Exception ex = newError(INVALID_REQUEST, keyPath);
-      ex.setErrorMessage(
-          "Only If-None-Match: * is supported for conditional put.");
+      ex.setErrorMessage("If-Match header cannot be empty.");
       throw ex;
     }
-
-    return new WriteConditions(trimmedIfNoneMatch, trimmedIfMatch);
+    return new DeleteCondition(ifMatch);
   }
 
   private static Response buildNotModifiedResponse(OzoneKey key) {
@@ -278,6 +281,30 @@ final class S3ConditionalRequest {
 
     boolean hasIfNoneMatch() {
       return ifNoneMatch != null;
+    }
+
+    boolean isCreateIfAbsent() {
+      return "*".equals(parseETag(ifNoneMatch));
+    }
+
+    String getExcludedETag() {
+      return isCreateIfAbsent() ? null : parseETag(ifNoneMatch);
+    }
+
+    boolean hasIfMatch() {
+      return ifMatch != null;
+    }
+
+    String getExpectedETag() {
+      return parseETag(ifMatch);
+    }
+  }
+
+  static final class DeleteCondition {
+    private final String ifMatch;
+
+    private DeleteCondition(String ifMatch) {
+      this.ifMatch = ifMatch;
     }
 
     boolean hasIfMatch() {

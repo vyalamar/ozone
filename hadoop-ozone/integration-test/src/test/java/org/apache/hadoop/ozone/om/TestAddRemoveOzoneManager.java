@@ -21,7 +21,8 @@ import static org.apache.hadoop.hdds.security.SecurityConfig.OZONE_TEST_AUTHORIZ
 import static org.apache.hadoop.ozone.OzoneConsts.SCM_DUMMY_SERVICE_ID;
 import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_OM_DECOMMISSIONED_NODES_KEY;
 import static org.apache.hadoop.ozone.om.OMConfigKeys.OZONE_OM_RATIS_SERVER_REQUEST_TIMEOUT_DEFAULT;
-import static org.apache.hadoop.ozone.om.TestOzoneManagerHA.createKey;
+import static org.apache.hadoop.ozone.om.OzoneManagerHATests.createKey;
+import static org.apache.ozone.test.OzoneTestBase.uniqueObjectName;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -38,7 +39,6 @@ import java.util.Collection;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
-import org.apache.commons.lang3.RandomStringUtils;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.utils.IOUtils;
 import org.apache.hadoop.hdfs.server.common.Storage;
@@ -83,8 +83,8 @@ public class TestAddRemoveOzoneManager {
   private static final String BUCKET_NAME;
 
   static {
-    VOLUME_NAME = "volume" + RandomStringUtils.secure().nextNumeric(5);
-    BUCKET_NAME = "bucket" + RandomStringUtils.secure().nextNumeric(5);
+    VOLUME_NAME = uniqueObjectName("volume");
+    BUCKET_NAME = uniqueObjectName("bucket");
   }
 
   private OzoneClient client;
@@ -222,7 +222,8 @@ public class TestAddRemoveOzoneManager {
    */
   @Test
   public void testBootstrap() throws Exception {
-    setupCluster(1);
+    // With admin authorization on, the new OMs are admitted as the user that runs the OMs.
+    setupCluster(1, true);
     OzoneManager oldOM = cluster.getOzoneManager();
 
     // 1. Add 2 new OMs to an existing 1 node OM cluster.
@@ -489,7 +490,7 @@ public class TestAddRemoveOzoneManager {
     // Verify decomm node is removed from the HA ring
     GenericTestUtils.waitFor(() -> {
       for (OzoneManager om : activeOMs) {
-        if (om.getPeerNodes().contains(decommNodeId)) {
+        if (om.getPeerNodes().stream().anyMatch(node -> node.getNodeId().equals(decommNodeId))) {
           return false;
         }
       }

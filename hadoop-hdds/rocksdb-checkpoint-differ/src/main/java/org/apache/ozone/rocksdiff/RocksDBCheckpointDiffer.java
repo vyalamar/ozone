@@ -340,16 +340,18 @@ public class RocksDBCheckpointDiffer implements AutoCloseable,
   public void close() {
     if (!closed) {
       synchronized (this) {
-        if (!closed) {
-          closed = true;
-          if (scheduler != null) {
-            LOG.info("Shutting down {}.", DAG_PRUNING_SERVICE_NAME);
-            scheduler.close();
-          }
-          if (sstFilePruningMetrics != null) {
-            sstFilePruningMetrics.unRegister();
-          }
+        if (closed) {
+          return;
         }
+        closed = true;
+      }
+      // Not under the lock: a task waiting for it must be able to get it, see closed and stop.
+      if (scheduler != null) {
+        LOG.info("Shutting down {}.", DAG_PRUNING_SERVICE_NAME);
+        scheduler.close();
+      }
+      if (sstFilePruningMetrics != null) {
+        sstFilePruningMetrics.unRegister();
       }
     }
   }
@@ -692,14 +694,16 @@ public class RocksDBCheckpointDiffer implements AutoCloseable,
     synchronized (this) {
       preconditionChecksForLoadAllCompactionLogs();
       addEntriesFromLogFilesToDagAndCompactionLogTable();
-      loadCompactionDagFromDB();
+      Set<String> referencedInputSstFiles = loadCompactionDagFromDB();
+      cleanupOrphanedSstBackupFiles(referencedInputSstFiles);
     }
   }
 
   /**
    * Read a compactionLofTable and create entries in the dags.
    */
-  private void loadCompactionDagFromDB() {
+  private Set<String> loadCompactionDagFromDB() {
+    Set<String> inputSstFilesFromCompactionLog = new HashSet<>();
     try (ManagedRocksIterator managedRocksIterator = new ManagedRocksIterator(
         activeRocksDB.get().newIterator(compactionLogTableCFHandle))) {
       managedRocksIterator.get().seekToFirst();
@@ -707,6 +711,8 @@ public class RocksDBCheckpointDiffer implements AutoCloseable,
         byte[] value = managedRocksIterator.get().value();
         CompactionLogEntry compactionLogEntry =
             CompactionLogEntry.getFromProtobuf(CompactionLogEntryProto.parseFrom(value));
+        compactionLogEntry.getInputFileInfoList()
+            .forEach(inputFile -> inputSstFilesFromCompactionLog.add(inputFile.getFileName()));
         compactionDag.populateCompactionDAG(compactionLogEntry.getInputFileInfoList(),
             compactionLogEntry.getOutputFileInfoList(), compactionLogEntry.getDbSequenceNumber());
         // Add the compaction log entry to the prune queue so that the backup input sst files can be pruned.
@@ -722,6 +728,7 @@ public class RocksDBCheckpointDiffer implements AutoCloseable,
         sstFilePruningMetrics.updateQueueSize(pruneQueue.size());
       }
     }
+    return inputSstFilesFromCompactionLog;
   }
 
   private void preconditionChecksForLoadAllCompactionLogs() {
@@ -1118,6 +1125,9 @@ public class RocksDBCheckpointDiffer implements AutoCloseable,
    * older than the maximum allowed in the compaction DAG.
    */
   private synchronized Pair<Set<String>, List<byte[]>> getOlderFileNodes() {
+    if (closed) {
+      return Pair.of(Collections.emptySet(), Collections.emptyList());
+    }
     long compactionLogPruneStartTime = System.currentTimeMillis();
     Set<String> compactionNodes = new HashSet<>();
     List<byte[]> keysToRemove = new ArrayList<>();
@@ -1151,6 +1161,9 @@ public class RocksDBCheckpointDiffer implements AutoCloseable,
 
   private synchronized void removeKeyFromCompactionLogTable(
       List<byte[]> keysToRemove) {
+    if (closed) {
+      return;
+    }
     try {
       for (byte[] key: keysToRemove) {
         activeRocksDB.get().delete(compactionLogTableCFHandle, key);
@@ -1158,6 +1171,45 @@ public class RocksDBCheckpointDiffer implements AutoCloseable,
     } catch (RocksDBException exception) {
       // TODO Handle exception properly before merging the PR.
       throw new RuntimeException(exception);
+    }
+  }
+
+  /**
+   * Removes SST files from the backup directory that were hard-linked during
+   * {@code onCompactionBegin} but never recorded in the compaction log because
+   * the compaction did not complete (for example, due to an OM crash/restart).
+   */
+  @VisibleForTesting
+  void cleanupOrphanedSstBackupFiles(Set<String> referencedInputSstFiles) {
+    Path sstBackupDirPath = Paths.get(sstBackupDir);
+    if (!Files.isDirectory(sstBackupDirPath)) {
+      return;
+    }
+
+    Set<String> orphanedFiles = new HashSet<>();
+    try (Stream<Path> pathStream = Files.list(sstBackupDirPath)) {
+      pathStream.filter(path -> path.getFileName().toString().endsWith(SST_FILE_EXTENSION))
+          .forEach(path -> {
+            String fileName = FilenameUtils.getBaseName(path.getFileName().toString());
+            if (!referencedInputSstFiles.contains(fileName)) {
+              orphanedFiles.add(fileName);
+            }
+          });
+    } catch (IOException e) {
+      LOG.warn("Failed to list SST backup directory " + sstBackupDir, e);
+    }
+
+    if (orphanedFiles.isEmpty()) {
+      return;
+    }
+
+    LOG.info("Removing orphaned SST backup files left by incomplete compactions: {}",
+        orphanedFiles);
+    try (UncheckedAutoCloseable ignored = getBootstrapStateLock().acquireReadLock()) {
+      removeSstFiles(orphanedFiles);
+    } catch (InterruptedException e) {
+      LOG.warn("Failed to remove orphaned SST backup files", e);
+      Thread.currentThread().interrupt();
     }
   }
 
@@ -1296,6 +1348,10 @@ public class RocksDBCheckpointDiffer implements AutoCloseable,
         CompactionLogEntry compactionLogEntry;
         // Get the compaction log entry.
         synchronized (this) {
+          // close() waits for this task only up to a timeout, then the DB is freed.
+          if (closed) {
+            break;
+          }
           try {
             compactionLogEntry = CompactionLogEntry.getCodec().fromPersistedFormat(
                 activeRocksDB.get().get(compactionLogTableCFHandle, compactionLogEntryKey));

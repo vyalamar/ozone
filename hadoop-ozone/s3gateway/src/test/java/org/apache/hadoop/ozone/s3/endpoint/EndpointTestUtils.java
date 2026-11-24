@@ -21,6 +21,7 @@ import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 import java.io.ByteArrayInputStream;
@@ -31,6 +32,11 @@ import javax.ws.rs.HttpMethod;
 import javax.ws.rs.core.HttpHeaders;
 import javax.ws.rs.core.Response;
 import org.apache.hadoop.ozone.OzoneConsts;
+import org.apache.hadoop.ozone.client.ObjectStore;
+import org.apache.hadoop.ozone.client.OzoneBucket;
+import org.apache.hadoop.ozone.client.OzoneClient;
+import org.apache.hadoop.ozone.client.OzoneVolume;
+import org.apache.hadoop.ozone.client.protocol.ClientProtocol;
 import org.apache.hadoop.ozone.s3.exception.OS3Exception;
 import org.apache.hadoop.ozone.s3.exception.S3ErrorTable;
 import org.apache.hadoop.ozone.s3.util.S3Consts;
@@ -40,6 +46,20 @@ import org.apache.ratis.util.function.CheckedSupplier;
 
 /** Utilities for unit-testing S3 endpoints. */
 public final class EndpointTestUtils {
+
+  /** Create an object endpoint backed by the supplied protocol and volume mocks. */
+  static ObjectEndpoint createObjectEndpoint(ClientProtocol protocol, OzoneVolume volume, String bucketName)
+      throws IOException {
+    OzoneClient mockClient = mock(OzoneClient.class);
+    ObjectStore objectStore = mock(ObjectStore.class);
+    when(mockClient.getObjectStore()).thenReturn(objectStore);
+    when(mockClient.getProxy()).thenReturn(protocol);
+    when(objectStore.getClientProxy()).thenReturn(protocol);
+    when(objectStore.getS3Volume()).thenReturn(volume);
+    when(volume.getName()).thenReturn("s3Volume");
+    when(volume.getBucket(bucketName)).thenReturn(mock(OzoneBucket.class));
+    return EndpointBuilder.newObjectEndpointBuilder().setClient(mockClient).build();
+  }
 
   /** Get key content. */
   public static Response get(
@@ -59,6 +79,40 @@ public final class EndpointTestUtils {
   ) throws IOException, OS3Exception {
     subject.queryParamsForTest().set(S3Consts.QueryParams.TAGGING, "");
     when(subject.getContext().getMethod()).thenReturn(HttpMethod.GET);
+    return subject.get(bucket, key);
+  }
+
+  /** Get object attributes (?attributes). */
+  public static Response getObjectAttributes(
+      ObjectEndpoint subject,
+      String bucket,
+      String key,
+      String attributesHeader
+  ) throws IOException, OS3Exception {
+    return getObjectAttributes(subject, bucket, key, attributesHeader, null, null);
+  }
+
+  /** Get object attributes (?attributes) with optional ObjectParts pagination headers. */
+  public static Response getObjectAttributes(
+      ObjectEndpoint subject,
+      String bucket,
+      String key,
+      String attributesHeader,
+      Integer maxParts,
+      Integer partNumberMarker
+  ) throws IOException, OS3Exception {
+    subject.queryParamsForTest().set(S3Consts.QueryParams.ATTRIBUTES, "");
+    when(subject.getContext().getMethod()).thenReturn(HttpMethod.GET);
+    when(subject.getHeaders().getHeaderString(S3Consts.OBJECT_ATTRIBUTES_HEADER))
+        .thenReturn(attributesHeader);
+    if (maxParts != null) {
+      when(subject.getHeaders().getHeaderString(S3Consts.MAX_PARTS_HEADER))
+          .thenReturn(String.valueOf(maxParts));
+    }
+    if (partNumberMarker != null) {
+      when(subject.getHeaders().getHeaderString(S3Consts.PART_NUMBER_MARKER_HEADER))
+          .thenReturn(String.valueOf(partNumberMarker));
+    }
     return subject.get(bucket, key);
   }
 
@@ -177,6 +231,47 @@ public final class EndpointTestUtils {
     return subject.delete(bucket, key);
   }
 
+  /**
+   * Get bucket tags (?tagging).
+   */
+  public static Response getBucketTagging(
+      BucketEndpoint subject,
+      String bucket
+  ) throws IOException, OS3Exception {
+    subject.queryParamsForTest().set(S3Consts.QueryParams.TAGGING, "");
+    when(subject.getContext().getMethod()).thenReturn(HttpMethod.GET);
+    return subject.get(bucket);
+  }
+
+  /**
+   * Add tagging on bucket (?tagging).
+   */
+  public static Response putBucketTagging(
+      BucketEndpoint subject, String bucket, String content)
+      throws IOException, OS3Exception {
+    subject.queryParamsForTest().set(S3Consts.QueryParams.TAGGING, "");
+    when(subject.getContext().getMethod()).thenReturn(HttpMethod.PUT);
+    setLengthHeader(subject, content);
+
+    if (content == null) {
+      return subject.put(bucket, null);
+    } else {
+      try (ByteArrayInputStream body = new ByteArrayInputStream(content.getBytes(UTF_8))) {
+        return subject.put(bucket, body);
+      }
+    }
+  }
+
+  /**
+   * Delete bucket tags (?tagging).
+   */
+  public static Response deleteBucketTagging(
+      BucketEndpoint subject, String bucket) throws IOException, OS3Exception {
+    subject.queryParamsForTest().set(S3Consts.QueryParams.TAGGING, "");
+    when(subject.getContext().getMethod()).thenReturn(HttpMethod.DELETE);
+    return subject.delete(bucket);
+  }
+
   /** Initiate multipart upload.
    * @return upload ID */
   public static String initiateMultipartUpload(ObjectEndpoint subject, String bucket, String key)
@@ -279,7 +374,7 @@ public final class EndpointTestUtils {
     return actual;
   }
 
-  private static void setLengthHeader(ObjectEndpoint subject, String content) {
+  private static void setLengthHeader(EndpointBase subject, String content) {
     when(subject.getHeaders().getHeaderString(HttpHeaders.CONTENT_LENGTH))
         .thenReturn(String.valueOf(contentLength(content)));
   }

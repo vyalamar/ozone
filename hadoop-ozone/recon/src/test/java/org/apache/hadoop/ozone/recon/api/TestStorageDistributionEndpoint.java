@@ -17,6 +17,7 @@
 
 package org.apache.hadoop.ozone.recon.api;
 
+import static org.apache.hadoop.ozone.container.upgrade.UpgradeUtils.defaultVersionProto;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -44,7 +45,8 @@ import org.apache.hadoop.hdds.scm.node.NodeStatus;
 import org.apache.hadoop.hdds.scm.server.OzoneStorageContainerManager;
 import org.apache.hadoop.ozone.recon.ReconContext;
 import org.apache.hadoop.ozone.recon.api.types.DUResponse;
-import org.apache.hadoop.ozone.recon.api.types.DataNodeMetricsServiceResponse;
+import org.apache.hadoop.ozone.recon.api.types.DataNodeMetricsCompleteResponse;
+import org.apache.hadoop.ozone.recon.api.types.DataNodeMetricsProgressResponse;
 import org.apache.hadoop.ozone.recon.api.types.DatanodePendingDeletionMetrics;
 import org.apache.hadoop.ozone.recon.api.types.DatanodeStorageReport;
 import org.apache.hadoop.ozone.recon.api.types.StorageCapacityDistributionResponse;
@@ -159,9 +161,9 @@ public class TestStorageDistributionEndpoint {
 
   @Test
   public void testDownloadReturnsAcceptedWhenCollectionInProgress() {
-    DataNodeMetricsServiceResponse metricsResponse = DataNodeMetricsServiceResponse.newBuilder()
-        .setStatus(DataNodeMetricsService.MetricCollectionStatus.IN_PROGRESS)
-        .build();
+    DataNodeMetricsProgressResponse metricsResponse = new DataNodeMetricsProgressResponse(
+        DataNodeMetricsService.MetricCollectionStatus.IN_PROGRESS,
+        "Metrics collection task is currently running. Please wait for task to finish.");
     when(dataNodeMetricsService.getCollectedMetrics(null)).thenReturn(metricsResponse);
     Response response = storageDistributionEndpoint.downloadDataNodeStorageDistribution();
 
@@ -172,9 +174,12 @@ public class TestStorageDistributionEndpoint {
 
   @Test
   public void testDownloadReturnsServerErrorWhenMetricsMissing() {
-    DataNodeMetricsServiceResponse metricsResponse = DataNodeMetricsServiceResponse.newBuilder()
-        .setStatus(DataNodeMetricsService.MetricCollectionStatus.FINISHED)
-        .build();
+    DataNodeMetricsCompleteResponse metricsResponse = new DataNodeMetricsCompleteResponse(
+        DataNodeMetricsService.MetricCollectionStatus.FINISHED,
+        0,
+        0,
+        0L,
+        null);
     when(dataNodeMetricsService.getCollectedMetrics(null)).thenReturn(metricsResponse);
     Response response = storageDistributionEndpoint.downloadDataNodeStorageDistribution();
 
@@ -231,7 +236,7 @@ public class TestStorageDistributionEndpoint {
           .build();
       pendingDeletionMetrics.add(new DatanodePendingDeletionMetrics(hostName,
           uuid.toString(), PENDING_DELETION_SIZE));
-      dataNodes.add(new DatanodeInfo(datanode, NodeStatus.inServiceHealthy(), null, 5 * 60 * 1000));
+      dataNodes.add(new DatanodeInfo(datanode, NodeStatus.inServiceHealthy(), defaultVersionProto(), 5 * 60 * 1000));
       when(nodeManager.getNodeStat(datanode))
           .thenReturn(new SCMNodeMetric(OZONE_CAPACITY, OZONE_USED, OZONE_REMAINING, COMMITTED,
               MIN_FREE_SPACE, RESERVED));
@@ -275,11 +280,13 @@ public class TestStorageDistributionEndpoint {
     when(reconGlobalStatsManager.getGlobalStatsValue(anyString()))
         .thenReturn(new GlobalStatsValue(GLOBAL_STAT_KEY_COUNT));
 
-    DataNodeMetricsServiceResponse metricsResponse =
-        DataNodeMetricsServiceResponse.newBuilder()
-            .setStatus(DataNodeMetricsService.MetricCollectionStatus.FINISHED)
-            .setPendingDeletion(pendingDeletionMetrics)
-            .build();
+    DataNodeMetricsCompleteResponse metricsResponse =
+        new DataNodeMetricsCompleteResponse(
+            DataNodeMetricsService.MetricCollectionStatus.FINISHED,
+            0,
+            0,
+            null,
+            pendingDeletionMetrics);
     when(dataNodeMetricsService.getCollectedMetrics(null))
         .thenReturn(metricsResponse);
     return csvRows;

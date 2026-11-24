@@ -48,6 +48,7 @@ import org.apache.hadoop.hdds.conf.ConfigurationSource;
 import org.apache.hadoop.hdds.conf.OzoneConfiguration;
 import org.apache.hadoop.hdds.protocol.datanode.proto.ContainerProtos.ContainerDataProto.State;
 import org.apache.hadoop.hdds.protocol.proto.HddsProtos.DiskBalancerRunningStatus;
+import org.apache.hadoop.hdds.protocol.proto.HddsProtos.NodeOperationalState;
 import org.apache.hadoop.hdds.scm.ScmConfigKeys;
 import org.apache.hadoop.hdds.utils.BackgroundTaskQueue;
 import org.apache.hadoop.ozone.container.checksum.ContainerChecksumTreeManager;
@@ -78,6 +79,7 @@ import org.junit.jupiter.api.io.TempDir;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
+import org.junit.jupiter.params.provider.ValueSource;
 
 /**
  * This is a test class for DiskBalancerService.
@@ -422,6 +424,46 @@ public class TestDiskBalancerService {
     svc.shutdown();
   }
 
+  @Test
+  public void testInitialDiskBalancerInfoUsesConfiguredValues() throws Exception {
+    File infoDir = tmpDir.resolve("diskBalancer-initial-info").toFile();
+    OzoneConfiguration testConf = confWithDiskBalancerInfoDir(infoDir);
+    DiskBalancerConfiguration diskBalancerConf = testConf.getObject(DiskBalancerConfiguration.class);
+    diskBalancerConf.setThreshold(25.0d);
+    diskBalancerConf.setDiskBandwidthInMB(50L);
+    diskBalancerConf.setParallelThread(2);
+    diskBalancerConf.setStopAfterDiskEven(false);
+    diskBalancerConf.setContainerStates("CLOSED");
+    testConf.setFromObject(diskBalancerConf);
+    DiskBalancerInfo expected = new DiskBalancerInfo(DiskBalancerRunningStatus.STOPPED, 25.0d, 50L, 2, false,
+        "CLOSED", DiskBalancerVersion.DEFAULT_VERSION);
+
+    DiskBalancerServiceTestImpl svc = getDiskBalancerService(testConf);
+
+    assertEquals(expected, svc.getDiskBalancerInfo());
+    assertEquals(expected, DiskBalancerYaml.readDiskBalancerInfoFile(getDiskBalancerInfoFile(infoDir)));
+    svc.shutdown();
+  }
+
+  @ParameterizedTest
+  @ValueSource(strings = {"0", "NaN"})
+  public void testInitialDiskBalancerInfoFallsBackToDefaultsForInvalidConfig(String rawThreshold) throws Exception {
+    File infoDir = tmpDir.resolve("diskBalancer-invalid-initial-info").toFile();
+    OzoneConfiguration testConf = confWithDiskBalancerInfoDir(infoDir);
+    testConf.set(DiskBalancerConfiguration.HDDS_DATANODE_DISK_BALANCER_THRESHOLD, rawThreshold);
+    testConf.setLong(DiskBalancerConfiguration.HDDS_DATANODE_DISK_BALANCER_BANDWIDTH, 0L);
+    testConf.setInt(DiskBalancerConfiguration.HDDS_DATANODE_DISK_BALANCER_PARALLEL_THREAD, 0);
+    DiskBalancerInfo expected = new DiskBalancerInfo(DiskBalancerRunningStatus.STOPPED,
+        DiskBalancerConfiguration.DEFAULT_THRESHOLD, DiskBalancerConfiguration.DEFAULT_DISK_BANDWIDTH_IN_MB,
+        DiskBalancerConfiguration.DEFAULT_PARALLEL_THREAD, true);
+
+    DiskBalancerServiceTestImpl svc = getDiskBalancerService(testConf);
+
+    assertEquals(expected, svc.getDiskBalancerInfo());
+    assertEquals(expected, DiskBalancerYaml.readDiskBalancerInfoFile(getDiskBalancerInfoFile(infoDir)));
+    svc.shutdown();
+  }
+
   @ContainerTestVersionInfo.ContainerTest
   public void testDiskBalancerInfoWriteReportsDirectoryCreationFailure(
       ContainerTestVersionInfo versionInfo) throws Exception {
@@ -434,6 +476,48 @@ public class TestDiskBalancerService {
 
     assertThat(exception)
         .hasMessageStartingWith("Unable to create DiskBalancerInfo directories: ");
+  }
+
+  @ContainerTestVersionInfo.ContainerTest
+  public void testNodeStateUpdatedRetainsPausedWhenPersistFails(
+      ContainerTestVersionInfo versionInfo) throws Exception {
+    setLayoutAndSchemaForTest(versionInfo);
+    File infoDir = tmpDir.resolve("diskBalancer-pause-persist-failure").toFile();
+    DiskBalancerServiceTestImpl svc =
+        getDiskBalancerService(confWithDiskBalancerInfoDir(infoDir));
+    svc.refresh(new DiskBalancerInfo(DiskBalancerRunningStatus.RUNNING, 10.0d, 100L, 5, true));
+    breakDiskBalancerInfoPersistence(infoDir);
+
+    svc.nodeStateUpdated(NodeOperationalState.DECOMMISSIONING);
+
+    assertEquals(DiskBalancerRunningStatus.PAUSED,
+        svc.getDiskBalancerInfo().getOperationalState());
+    assertTrue(svc.getTasks().isEmpty());
+    svc.shutdown();
+  }
+
+  @ContainerTestVersionInfo.ContainerTest
+  public void testNodeStateUpdatedRevertsToPausedWhenResumePersistFails(
+      ContainerTestVersionInfo versionInfo) throws Exception {
+    setLayoutAndSchemaForTest(versionInfo);
+    File infoDir = tmpDir.resolve("diskBalancer-resume-persist-failure").toFile();
+    DiskBalancerServiceTestImpl svc =
+        getDiskBalancerService(confWithDiskBalancerInfoDir(infoDir));
+    svc.refresh(new DiskBalancerInfo(DiskBalancerRunningStatus.PAUSED, 10.0d, 100L, 5, true));
+    breakDiskBalancerInfoPersistence(infoDir);
+
+    svc.nodeStateUpdated(NodeOperationalState.IN_SERVICE);
+
+    assertEquals(DiskBalancerRunningStatus.PAUSED,
+        svc.getDiskBalancerInfo().getOperationalState());
+    assertTrue(svc.getTasks().isEmpty());
+    svc.shutdown();
+  }
+
+  private void breakDiskBalancerInfoPersistence(File infoDir) throws IOException {
+    File infoFile = getDiskBalancerInfoFile(infoDir);
+    FileUtils.deleteQuietly(infoFile);
+    assertTrue(infoFile.mkdirs(), "Failed to replace diskBalancer.info with a directory");
   }
 
   @ContainerTestVersionInfo.ContainerTest
@@ -484,6 +568,9 @@ public class TestDiskBalancerService {
         Arguments.arguments(-1.0, true, null),
         Arguments.arguments(-0.001, true, null),
         Arguments.arguments(100.001, true, null),
+        Arguments.arguments(Double.NaN, true, null),
+        Arguments.arguments(Double.POSITIVE_INFINITY, true, null),
+        Arguments.arguments(Double.NEGATIVE_INFINITY, true, null),
         // Valid boundary values that should be accepted
         Arguments.arguments(0.001, false, 0.001),
         Arguments.arguments(99.999, false, 99.999),
