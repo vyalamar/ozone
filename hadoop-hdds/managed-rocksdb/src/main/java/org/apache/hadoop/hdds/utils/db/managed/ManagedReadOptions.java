@@ -77,6 +77,14 @@ public class ManagedReadOptions extends ReadOptions {
     return copy(upperBound);
   }
 
+  public boolean hasLowerBound() {
+    return lowerBound != null;
+  }
+
+  public boolean hasUpperBound() {
+    return upperBound != null;
+  }
+
   private void closeOnConstructorFailure(ManagedSlice lowerSlice,
       ManagedSlice upperSlice, Throwable failure) {
     IOUtils.closeAndSuppress(this::closeReadOptions, failure);

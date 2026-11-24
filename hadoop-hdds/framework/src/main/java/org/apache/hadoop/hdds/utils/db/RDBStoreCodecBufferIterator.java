@@ -17,6 +17,7 @@
 
 package org.apache.hadoop.hdds.utils.db;
 
+import java.nio.ByteBuffer;
 import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
 import org.apache.hadoop.hdds.utils.db.managed.ManagedReadOptions;
@@ -44,8 +45,9 @@ class RDBStoreCodecBufferIterator extends RDBStoreAbstractIterator<CodecBuffer> 
     final String name = table != null ? table.getName() : null;
     this.keyBuffer = new Buffer(
         new CodecBuffer.Capacity(name + "-iterator-key", 1 << 10),
-        // it has to read key for matching prefix.
-        getType().readKey() || prefix != null ? buffer -> getRocksDBIterator().get().key(buffer) : null);
+        // Read key only if requested or needed for Java-side prefix matching.
+        getType().readKey() || (prefix != null && !hasNativeUpperBound())
+            ? buffer -> getRocksDBIterator().get().key(buffer) : null);
     this.valueBuffer = new Buffer(
         new CodecBuffer.Capacity(name + "-iterator-value", 4 << 10),
         getType().readValue() ? buffer -> getRocksDBIterator().get().value(buffer) : null);
@@ -91,6 +93,28 @@ class RDBStoreCodecBufferIterator extends RDBStoreAbstractIterator<CodecBuffer> 
       return false;
     }
     return key.startsWith(prefix);
+  }
+
+  @Override
+  boolean isBeforePrefix(CodecBuffer key) {
+    assertOpen();
+    final CodecBuffer prefix = getPrefix();
+    if (prefix == null) {
+      return false;
+    }
+    if (key == null) {
+      return true;
+    }
+    final ByteBuffer k = key.asReadOnlyByteBuffer();
+    final ByteBuffer p = prefix.asReadOnlyByteBuffer();
+    final int n = Math.min(k.remaining(), p.remaining());
+    for (int i = 0; i < n; i++) {
+      final int c = (k.get(k.position() + i) & 0xFF) - (p.get(p.position() + i) & 0xFF);
+      if (c != 0) {
+        return c < 0;
+      }
+    }
+    return k.remaining() < p.remaining();
   }
 
   @Override

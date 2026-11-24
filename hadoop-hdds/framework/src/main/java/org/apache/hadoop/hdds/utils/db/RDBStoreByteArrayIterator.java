@@ -80,4 +80,23 @@ class RDBStoreByteArrayIterator extends RDBStoreAbstractIterator<byte[]> {
     }
     return true;
   }
+
+  @Override
+  boolean isBeforePrefix(byte[] key) {
+    final byte[] prefix = getPrefix();
+    if (prefix == null) {
+      return false;
+    }
+    if (key == null) {
+      return true;
+    }
+    final int n = Math.min(key.length, prefix.length);
+    for (int i = 0; i < n; i++) {
+      final int c = (key[i] & 0xFF) - (prefix[i] & 0xFF);
+      if (c != 0) {
+        return c < 0;
+      }
+    }
+    return key.length < prefix.length;
+  }
 }

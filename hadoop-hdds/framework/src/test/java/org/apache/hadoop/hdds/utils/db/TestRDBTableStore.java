@@ -680,6 +680,8 @@ public class TestRDBTableStore {
           keys);
 
       assertArrayEquals(bytes("prefix-aa-key-01"),
+          iter.seek(bytes("prefix-a0")).getKey());
+      assertArrayEquals(bytes("prefix-aa-key-01"),
           iter.seek(bytes("prefix-aa-key-01")).getKey());
       assertNull(iter.seek(bytes("prefix-ab")));
       assertFalse(iter.hasNext());

@@ -122,6 +122,17 @@ abstract class RDBStoreAbstractIterator<RAW>
   /** Does the given key start with the prefix? */
   abstract boolean startsWithPrefix(RAW key);
 
+  /** Does the given key sort strictly before the prefix in RocksDB byte order? */
+  abstract boolean isBeforePrefix(RAW key);
+
+  final boolean hasNativeUpperBound() {
+    return readOptions != null && readOptions.hasUpperBound();
+  }
+
+  private boolean matchesPrefix() {
+    return prefix == null || hasNativeUpperBound() || startsWithPrefix(key());
+  }
+
   final ManagedRocksIterator getRocksDBIterator() {
     return rocksDBIterator;
   }
@@ -168,8 +179,7 @@ abstract class RDBStoreAbstractIterator<RAW>
       return false;
     }
     initializeIfNeeded();
-    return rocksDBIterator.get().isValid() &&
-        (prefix == null || startsWithPrefix(key()));
+    return rocksDBIterator.get().isValid() && matchesPrefix();
   }
 
   @Override
@@ -208,8 +218,12 @@ abstract class RDBStoreAbstractIterator<RAW>
   @Override
   public final Table.KeyValue<RAW, RAW> seek(RAW key) {
     // Prefix-bounded RocksDB iterators must not seek below their native
-    // lower bound. RocksDB documents that case as undefined.
-    seek0(key);
+    // lower bound (RocksDB documents that case as undefined). Clamp to prefix.
+    if (prefix != null && isBeforePrefix(key)) {
+      seek0(prefix);
+    } else {
+      seek0(key);
+    }
     initialized = true;
     setCurrentEntry();
     return currentEntry;

@@ -18,6 +18,7 @@
 package org.apache.hadoop.hdds.utils.db;
 
 import static org.apache.hadoop.hdds.utils.db.IteratorType.KEY_AND_VALUE;
+import static org.apache.hadoop.hdds.utils.db.IteratorType.VALUE_ONLY;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -27,10 +28,12 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import java.nio.ByteBuffer;
 import org.apache.hadoop.hdds.utils.db.managed.ManagedReadOptions;
 import org.apache.hadoop.hdds.utils.db.managed.ManagedRocksIterator;
 import org.apache.hadoop.hdds.utils.db.managed.ManagedRocksObjectUtils;
@@ -181,6 +184,48 @@ public class TestRDBStoreAbstractIterator {
     assertThrows(IllegalStateException.class, iterator::close);
     assertFalse(readOptions.isLowerBoundSliceOwningHandle());
     assertFalse(readOptions.isUpperBoundSliceOwningHandle());
+  }
+
+  @Test
+  public void testSeekBelowPrefixClampsToPrefix() {
+    final RocksIterator rocksIterator = mock(RocksIterator.class);
+    final byte[] prefix = new byte[] {'b', '0'};
+    final ManagedReadOptions readOptions = RDBStoreAbstractIterator.newReadOptions(prefix, false);
+    try (RDBStoreByteArrayIterator iterator = new RDBStoreByteArrayIterator(
+        new ManagedRocksIterator(rocksIterator), null, prefix, KEY_AND_VALUE, readOptions)) {
+      iterator.seek(new byte[] {'a', '9'});
+      verify(rocksIterator, times(1)).seek(prefix);
+    }
+
+    final RocksIterator codecRocksIterator = mock(RocksIterator.class);
+    final ManagedReadOptions codecReadOptions = RDBStoreAbstractIterator.newReadOptions(prefix, false);
+    try (RDBStoreCodecBufferIterator codecIterator = new RDBStoreCodecBufferIterator(
+        new ManagedRocksIterator(codecRocksIterator), null, CodecBuffer.wrap(prefix),
+        KEY_AND_VALUE, codecReadOptions);
+         CodecBuffer below = CodecBuffer.wrap(new byte[] {'a', '9'})) {
+      codecIterator.seek(below);
+      verify(codecRocksIterator, times(1)).seek(ByteBuffer.wrap(prefix));
+    }
+  }
+
+  @Test
+  public void testValueOnlyWithNativeUpperBoundSkipsKeyRead() {
+    final RocksIterator rocksIterator = mock(RocksIterator.class);
+    final byte[] prefix = new byte[] {'p'};
+    final byte[] val = new byte[] {'v'};
+    when(rocksIterator.isValid()).thenReturn(true, true, true, false);
+    when(rocksIterator.value()).thenReturn(val);
+    final ManagedReadOptions readOptions = RDBStoreAbstractIterator.newReadOptions(prefix, false);
+
+    try (RDBStoreByteArrayIterator iterator = new RDBStoreByteArrayIterator(
+        new ManagedRocksIterator(rocksIterator), null, prefix, VALUE_ONLY, readOptions)) {
+      assertTrue(iterator.hasNext());
+      final Table.KeyValue<byte[], byte[]> kv = iterator.next();
+      assertNull(kv.getKey());
+      assertArrayEquals(val, kv.getValue());
+      assertFalse(iterator.hasNext());
+    }
+    verify(rocksIterator, never()).key();
   }
 
   private static final class CountingReadOptions extends ManagedReadOptions {
